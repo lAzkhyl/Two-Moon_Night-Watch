@@ -2,36 +2,49 @@
 # MODULE: cogs/admin.py
 # =====
 # Architecture Overview:
-# Administrator Control Panel. Handles day-to-day management: economy parameters,
-# game channels, point adjustments, and system state toggling.
+# Administrator Control Panel — Entity-First Dropdown Navigation.
 #
-# Every config change is written to 'config_audit_log' for a full paper trail.
+# UI ARCHITECTURE (v5):
+#   /admin opens AdminRootView containing ONE discord.ui.Select (AdminNavSelect).
+#   Selecting a category navigates to that panel view (no page reload, in-place edit).
+#   Every panel renders two stacked embeds:
+#     Embed 1 — State card:  current live config values for this category.
+#     Embed 2 — Guide card:  concise description of each control in the panel.
 #
-# UI ARCHITECTURE:
-# Every panel (main + all sub-panels) renders as two stacked embeds per message:
-#   Embed 1 — State card: current live values, roles, last audit entry.
-#   Embed 2 — Guide card: concise description of each button/setting.
-# Main panel carries Asset Server GIF thumbnails. Sub-panels omit thumbnails.
-# Emoji constants and thumbnail URLs live in utils/emojis.py.
+# CMS INTEGRATION:
+#   All embed titles, colors, and thumbnails are stored in bot_config under
+#   keys like `embed.admin.<key>` (seeded by migration 006).
+#   _build_cms_embed() is the single DRY helper that loads CMS data and
+#   constructs the embed — no copy-pasted fallback blocks anywhere.
+#
+# CATEGORY → VIEW MAP:
+#   ⚙️ System & Channels  → AdminSystemView
+#   👥 Point               → AdminPointView   (Economy + Decay unified)
+#   🎮 Host & Events       → AdminHostView
+#   🗳️ Vote & Reputation   → AdminVoteView
+#   🛒 Shop Management     → AdminShopView
 #
 # CHANGELOG:
-# FIX-ADM-001: Race condition in Setup Wizard — SELECT FOR UPDATE per guild.
-# FIX-ADM-002: Draft delete not atomic — DELETE now in same tx as bulk_set_config.
-# FIX-ADM-003: AdminNumberModal returned error without keeping panel alive — fixed.
-# FIX-ADM-004: Set ACTIVE/PAUSED now requires ConfirmSystemStateView.
-# FIX-ADM-005: AdminChannelSel.callback() defers before DB write.
-# FIX-ADM-006: set_active/set_paused now defer before edit.
-# FIX-ADM-007: All Views store message ref and call edit on timeout.
-# FIX-ADM-008: ForcePointsModal ID parsing replaced lstrip with re.sub.
-# FIX-ADM-009: Decay view label corrected from "Tiers" to "Decay".
-# FIX-ADM-010: _format_role_ids deduplicated — single shared implementation.
-# FIX-ADM-011: AdminDecayView, AdminHostView, AdminVoteView added.
-# FIX-ADM-012: require_mod guard in b9 uses explicit defer.
-# FIX-ADM-013: Setup Wizard preset descriptions added (wizard later removed).
-# FIX-ADM-014: AdminNumberModal shows current value in placeholder.
-# REFACTOR-ADM-015: Full UI overhaul — dual-embed layout, small-caps titles,
-#                   per-section current-value display, consistent colour palette,
-#                   last-audit-entry preview in main panel header.
+#   FIX-ADM-001  Race condition in Setup Wizard — SELECT FOR UPDATE per guild.
+#   FIX-ADM-002  Draft delete not atomic — wrapped in same tx as bulk_set_config.
+#   FIX-ADM-003  AdminNumberModal error is ephemeral — panel stays alive.
+#   FIX-ADM-004  State changes require ConfirmSystemStateView before execution.
+#   FIX-ADM-005  AdminChannelSel.callback() defers before DB write.
+#   FIX-ADM-006  set_active/set_paused defer before edit.
+#   FIX-ADM-007  All Views store message ref and call edit on timeout.
+#   FIX-ADM-008  ForcePointsModal ID parsing uses re.sub, not lstrip.
+#   FIX-ADM-009  Decay label corrected.
+#   FIX-ADM-010  _format_role_ids deduplicated — single shared implementation.
+#   FIX-ADM-011  Host / Vote / Decay views added.
+#   FIX-ADM-012  require_mod guard uses explicit defer.
+#   FIX-ADM-013  Setup Wizard preset descriptions added.
+#   FIX-ADM-014  AdminNumberModal shows current value in placeholder.
+#   REFACTOR-ADM-015  Dual-embed layout, small-caps titles, colour palette.
+#   REFACTOR-ADM-016  Full Entity-First Dropdown architecture.
+#                     Economy + Decay consolidated into 👥 Point.
+#                     Shop Management panel implemented.
+#                     _build_cms_embed() DRY helper introduced.
+#                     _TimeoutView base class eliminates on_timeout boilerplate.
 # =====
 
 import io
@@ -55,47 +68,63 @@ from economy.points import award, deduct
 from guards.checks import require_admin, require_mod
 from utils.embeds import ERROR, PRIMARY, WARNING, confirm_embed, error_embed, success_embed
 from utils.emojis import ALERT_PAUSED, TICK_ACTIVE, THUMBNAIL_ADMIN, THUMBNAIL_NAV
-from utils.paginator import Paginator, build_pages
 from utils.time import format_relative
 
 logger = logging.getLogger(__name__)
 
 
-# =====
-# PANEL CONSTANTS
-# =====
+# =============================================================================
+# CONSTANTS
+# =============================================================================
 
-# Small-cap Unicode section titles
-_T_ADMIN   = "ᴀᴅᴍɪɴ ᴄᴏɴᴛʀᴏʟ"
+# Small-cap Unicode titles — used as fallbacks when CMS key is missing.
+_T_ROOT    = "ᴀᴅᴍɪɴ ᴄᴏɴᴛʀᴏʟ"
 _T_NAV     = "ɴᴀᴠɪɢᴀᴛɪᴏɴ ɢᴜɪᴅᴇ"
-_T_ECONOMY = "⚙️ ᴇᴄᴏɴᴏᴍʏ"
-_T_EC_G    = "⚙️ ᴇᴄᴏɴᴏᴍʏ ɢᴜɪᴅᴇ"
-_T_DECAY   = "⏱️ ᴅᴇᴄᴀʏ"
-_T_DC_G    = "⏱️ ᴅᴇᴄᴀʏ ɢᴜɪᴅᴇ"
-_T_HOST    = "🎮 ʜᴏꜱᴛ"
+_T_SYSTEM  = "⚙️ ꜱʏꜱᴛᴇᴍ & ᴄʜᴀɴɴᴇʟꜱ"
+_T_SY_G    = "⚙️ ꜱʏꜱᴛᴇᴍ ɢᴜɪᴅᴇ"
+_T_POINT   = "👥 ᴘᴏɪɴᴛ"
+_T_PT_G    = "👥 ᴘᴏɪɴᴛ ɢᴜɪᴅᴇ"
+_T_HOST    = "🎮 ʜᴏꜱᴛ & ᴇᴠᴇɴᴛꜱ"
 _T_HO_G    = "🎮 ʜᴏꜱᴛ ɢᴜɪᴅᴇ"
-_T_VOTE    = "🗳️ ᴠᴏᴛᴇ"
+_T_VOTE    = "🗳️ ᴠᴏᴛᴇ & ʀᴇᴘᴜᴛᴀᴛɪᴏɴ"
 _T_VO_G    = "🗳️ ᴠᴏᴛᴇ ɢᴜɪᴅᴇ"
-_T_CHANNEL = "📡 ᴄʜᴀɴɴᴇʟꜱ"
-_T_CH_G    = "📡 ᴄʜᴀɴɴᴇʟ ɢᴜɪᴅᴇ"
-_T_SYSTEM  = "🔧 ꜱʏꜱᴛᴇᴍ"
-_T_SY_G    = "🔧 ꜱʏꜱᴛᴇᴍ ɢᴜɪᴅᴇ"
-_T_FORCE   = "⚡ ꜰᴏʀᴄᴇ"
-_T_FO_G    = "⚡ ꜰᴏʀᴄᴇ ɢᴜɪᴅᴇ"
+_T_SHOP    = "🛒 ꜱʜᴏᴘ ᴍᴀɴᴀɢᴇᴍᴇɴᴛ"
+_T_SH_G    = "🛒 ꜱʜᴏᴘ ɢᴜɪᴅᴇ"
+_T_ITEM    = "📦 ɪᴛᴇᴍ ᴄᴏɴᴛʀᴏʟ"
 
-# Accent colours (main panel only — sub-panels use PRIMARY / WHITE)
 _C_RED   = 0xFF0000
 _C_WHITE = 0xFFFFFF
 
 
-# =====
+# =============================================================================
+# BASE VIEW — eliminates on_timeout boilerplate in every sub-view
+# =============================================================================
+
+class _TimeoutView(discord.ui.View):
+    """Disables all children and updates the message when the view times out."""
+
+    def __init__(self, timeout: float = 300):
+        super().__init__(timeout=timeout)
+        self.message: discord.Message | None = None
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+# =============================================================================
 # SHARED UTILITY FUNCTIONS
-# =====
+# =============================================================================
 
 def _format_role_ids(guild: discord.Guild, raw_val: str | None) -> str:
     """
     Parses both legacy single-ID strings and modern JSON arrays into role mentions.
-    FIX-ADM-010: Single shared implementation — owner.py should import this.
+    FIX-ADM-010: Single shared implementation.
     """
     if not raw_val or raw_val in ("null", "[]"):
         return "*(not set)*"
@@ -114,10 +143,7 @@ def _format_role_ids(guild: discord.Guild, raw_val: str | None) -> str:
 
 
 def _val(raw: str | None, suffix: str = "") -> str:
-    """
-    Formats a raw config value for display.
-    Returns backtick-wrapped value+suffix, or *(not set)* when absent.
-    """
+    """Formats a raw config value for inline display; *(not set)* when absent."""
     if not raw or raw in ("null", "[]", ""):
         return "*(not set)*"
     return f"`{raw}{suffix}`"
@@ -128,19 +154,71 @@ def _ch(raw: str | None) -> str:
     return f"<#{raw}>" if raw else "*(not set)*"
 
 
-# =====
-# PANEL EMBED BUILDERS
-# Each builder is async and returns [embed_state, embed_guide].
-# =====
+async def _build_cms_embed(
+    guild_id: str,
+    cms_key: str,
+    fallback_title: str,
+    fallback_color: int,
+    description: str | None = None,
+    fallback_desc: str = "",
+) -> discord.Embed:
+    """
+    Single DRY helper for constructing every admin panel embed.
 
-async def _main_panel_embeds(i: discord.Interaction) -> list[discord.Embed]:
-    """Main admin panel — two embeds: status card + navigation guide."""
+    Loads title, color, and thumbnail from the CMS database record at
+    `embed.admin.<cms_key>`. The description argument controls two modes:
+
+      description=<str>  → State embed: uses caller-provided live content.
+                           DB description field is ignored (it's a template).
+      description=None   → Guide embed: uses DB description or fallback_desc.
+
+    This function is the ONLY place embed fallback logic exists in this module.
+    """
+    title  = fallback_title
+    color  = fallback_color
+    thumb  = None
+    db_desc = fallback_desc
+
+    raw = await get_config_or_none(guild_id, f"embed.admin.{cms_key}")
+    if raw:
+        try:
+            cfg    = json.loads(raw)
+            title  = cfg.get("title",     fallback_title)
+            color  = int(cfg.get("color", fallback_color))
+            thumb  = cfg.get("thumbnail") or None
+            db_desc = cfg.get("description", fallback_desc)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+    final_desc = description if description is not None else db_desc
+    e = discord.Embed(title=title, description=final_desc, color=color)
+    if thumb:
+        e.set_thumbnail(url=thumb)
+    return e
+
+
+async def _open_number_modal(
+    i: discord.Interaction,
+    key: str,
+    title: str,
+    placeholder: str,
+) -> None:
+    """Fetches current value then opens the modal with an informative placeholder."""
+    current = await get_config_or_none(str(i.guild_id), key)
+    await i.response.send_modal(AdminNumberModal(key, title, placeholder, current_value=current))
+
+
+# =============================================================================
+# PANEL EMBED BUILDERS
+# Each async function returns [state_embed, guide_embed].
+# =============================================================================
+
+async def _root_panel_embeds(i: discord.Interaction) -> list[discord.Embed]:
+    """Main panel — system status card + navigation guide."""
     gid    = str(i.guild_id)
+    state  = await get_config_or_none(gid, "system.state") or "UNCONFIGURED"
     ar_raw = await get_config_or_none(gid, "system.admin_role_id")
     mr_raw = await get_config_or_none(gid, "system.mod_role_id")
-
-    ar_display = _format_role_ids(i.guild, ar_raw)
-    mr_display = _format_role_ids(i.guild, mr_raw)
 
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -153,1615 +231,599 @@ async def _main_panel_embeds(i: discord.Interaction) -> list[discord.Embed]:
             gid,
         )
 
-    # Last-edit footer: shows who edited and exactly which key changed.
     audit_line = ""
     if last_audit:
         relative = format_relative(last_audit["changed_at"])
-        key      = last_audit["config_key"]
-        new_val  = str(last_audit["new_value"] or "—")
-        if len(new_val) > 40:
-            new_val = new_val[:37] + "..."
+        new_val  = str(last_audit["new_value"] or "—")[:37]
         audit_line = (
             f"\n-# Edited {relative} by <@{last_audit['changed_by']}>\n"
-            f"> -# {key} → {new_val}"
+            f"> -# {last_audit['config_key']} → {new_val}"
         )
 
-    desc_e1 = (
-        f"**{TICK_ACTIVE} ACTIVE / {ALERT_PAUSED} PAUSED**\n"
+    if state == "ACTIVE":
+        state_str = f"{TICK_ACTIVE} **ACTIVE**"
+    elif state == "PAUSED":
+        state_str = f"{ALERT_PAUSED} **PAUSED**"
+    else:
+        state_str = "🔴 **UNCONFIGURED**"
+
+    desc_state = (
+        f"**{state_str}**\n"
         f"### Authorization:\n"
-        f"**Admin:**\n> {ar_display}\n\n"
-        f"**Mod:**\n> {mr_display}"
+        f"**Admin:**\n> {_format_role_ids(i.guild, ar_raw)}\n\n"
+        f"**Mod:**\n> {_format_role_ids(i.guild, mr_raw)}"
         f"{audit_line}"
     )
-    e1 = discord.Embed(title=_T_ADMIN, description=desc_e1, color=_C_RED)
+    desc_guide = (
+        "⚙️ **System & Channels** — Bot state, point name, channel bindings, force actions.\n\n"
+        "👥 **Point** — Event economy (join/end bonus, event math) and decay zones.\n\n"
+        "🎮 **Host & Events** — Hosting rules: cooldown, duration, income multiplier.\n\n"
+        "🗳️ **Vote & Reputation** — Post-event voting window and score weights.\n\n"
+        "🛒 **Shop Management** — Add and manage purchasable shop items."
+    )
+
+    e1 = await _build_cms_embed(gid, "main",       _T_ROOT, _C_RED,   description=desc_state)
+    e2 = await _build_cms_embed(gid, "main_guide",  _T_NAV,  _C_WHITE, fallback_desc=desc_guide)
     e1.set_thumbnail(url=THUMBNAIL_ADMIN)
-
-    desc_e2 = (
-        "⚙️ Economy\n"
-        "> Award rates for joining & completing events.\n"
-        "> Tune join bonus, completion bonus, point cap,\n"
-        "> and the time window counted toward scaling.\n\n"
-        "⏱️ Decay\n"
-        "> Controls how quickly idle users lose points.\n"
-        "> Set grace period, three zone durations,\n"
-        "> and the per-day loss rate for each zone.\n\n"
-        "🎮 Host\n"
-        "> Rules governing who can host and how often.\n"
-        "> Cooldown, min duration, voter threshold,\n"
-        "> income multiplier, and reputation window.\n\n"
-        "🗳️ Vote\n"
-        "> Post-event host reputation system.\n"
-        "> Configure the voting window and the score\n"
-        "> weight assigned to each vote type.\n\n"
-        "📡 Channels\n"
-        "> Bind bot features to specific channels.\n"
-        "> Gamenight text, activity feed,\n"
-        "> and the VC category for event rooms.\n\n"
-        "👁️ View All\n"
-        "> Export every config key to a .txt file.\n"
-        "> Useful for auditing, backup review,\n"
-        "> or diagnosing unexpected bot behaviour.\n\n"
-        "🔧 System\n"
-        "> Master on/off switch for the bot.\n"
-        "> ACTIVE enables all public commands;\n"
-        "> PAUSED blocks them while admin still works.\n\n"
-        "⚡ Force\n"
-        "> Direct point balance manipulation. Mod+ only.\n"
-        "> Award or deduct any amount from any user\n"
-        "> by entering their ID or @mention."
-    )
-    e2 = discord.Embed(title=_T_NAV, description=desc_e2, color=_C_WHITE)
     e2.set_thumbnail(url=THUMBNAIL_NAV)
-
-    return [e1, e2]
-
-
-async def _economy_panel_embeds(i: discord.Interaction) -> list[discord.Embed]:
-    """Economy sub-panel — current values + field descriptions."""
-    gid = str(i.guild_id)
-    join_b  = await get_config_or_none(gid, "ec.join_bonus")
-    comp_b  = await get_config_or_none(gid, "ec.completion_bonus")
-    max_b   = await get_config_or_none(gid, "ec.base_max_bonus")
-    t_cap   = await get_config_or_none(gid, "ec.t_cap")
-
-    desc_e1 = (
-        f"**Join Bonus** — {_val(join_b, ' pts')}\n"
-        f"**Completion Bonus** — {_val(comp_b, ' pts')}\n"
-        f"**Max Bonus** — {_val(max_b, ' pts')}\n"
-        f"**Time Cap** — {_val(t_cap, ' min')}"
-    )
-    e1 = discord.Embed(title=_T_ECONOMY, description=desc_e1, color=PRIMARY)
-
-    desc_e2 = (
-        "**Join Bonus** — Points awarded to each participant at the moment they join.\n"
-        "**Completion Bonus** — Extra points distributed when the host ends the event normally.\n"
-        "**Max Bonus** — Hard ceiling on total points a single user can earn per event.\n"
-        "**Time Cap** — Maximum event minutes counted toward time-based bonus scaling.\n\n"
-        "> Adjust **Max Bonus** first if the economy feels inflationary.\n"
-        "> Lower **Time Cap** to reduce the edge gained by running very long events."
-    )
-    e2 = discord.Embed(title=_T_EC_G, description=desc_e2, color=_C_WHITE)
-
-    return [e1, e2]
-
-
-async def _decay_panel_embeds(i: discord.Interaction) -> list[discord.Embed]:
-    """Decay sub-panel — current zone config + decay mechanics guide."""
-    gid = str(i.guild_id)
-    grace = await get_config_or_none(gid, "decay.grace_days")
-    z1_d  = await get_config_or_none(gid, "decay.zone1_days")
-    z2_d  = await get_config_or_none(gid, "decay.zone2_days")
-    r1    = await get_config_or_none(gid, "decay.rate_zone1")
-    r2    = await get_config_or_none(gid, "decay.rate_zone2")
-    r3    = await get_config_or_none(gid, "decay.rate_zone3")
-
-    desc_e1 = (
-        f"**Grace Period** — {_val(grace, ' days')}\n"
-        f"**Zone 1** — {_val(z1_d, ' days')}  ·  {_val(r1, ' pts/day')}\n"
-        f"**Zone 2** — {_val(z2_d, ' days')}  ·  {_val(r2, ' pts/day')}\n"
-        f"**Zone 3** — indefinite  ·  {_val(r3, ' pts/day')}"
-    )
-    e1 = discord.Embed(title=_T_DECAY, description=desc_e1, color=PRIMARY)
-
-    desc_e2 = (
-        "Inactivity decay runs daily. A user's points erode once the grace period expires.\n\n"
-        "**Grace Period** — Days of inactivity before any decay begins.\n"
-        "**Zone 1 / Zone 2 Duration** — How many days each phase lasts before advancing.\n"
-        "**Zone 3** begins after Zone 1 + Zone 2 has elapsed and runs indefinitely.\n\n"
-        "**Rate Zone 1–3** — Points lost per day in each zone. Zone 3 is the steepest.\n\n"
-        "> Any server activity from the user resets the clock back to the grace period."
-    )
-    e2 = discord.Embed(title=_T_DC_G, description=desc_e2, color=_C_WHITE)
-
-    return [e1, e2]
-
-
-async def _host_panel_embeds(i: discord.Interaction) -> list[discord.Embed]:
-    """Host sub-panel — current host config + field guide."""
-    gid = str(i.guild_id)
-    cooldown    = await get_config_or_none(gid, "host.cooldown_hours")
-    min_dur     = await get_config_or_none(gid, "host.min_duration_minutes")
-    min_voters  = await get_config_or_none(gid, "host.min_voters")
-    income_mult = await get_config_or_none(gid, "host.income_multiplier")
-    rolling     = await get_config_or_none(gid, "host.rolling_window")
-    outlier     = await get_config_or_none(gid, "host.outlier_trim_threshold")
-
-    desc_e1 = (
-        f"**Cooldown** — {_val(cooldown, ' hours')}\n"
-        f"**Min Duration** — {_val(min_dur, ' min')}\n"
-        f"**Min Voters** — {_val(min_voters)}\n"
-        f"**Income Multiplier** — {_val(income_mult, '×')}\n"
-        f"**Rolling Window** — {_val(rolling, ' events')}\n"
-        f"**Outlier Trim** — {_val(outlier, ' votes')}"
-    )
-    e1 = discord.Embed(title=_T_HOST, description=desc_e1, color=PRIMARY)
-
-    desc_e2 = (
-        "**Cooldown** — Hours a host must wait before they can open another event.\n"
-        "**Min Duration** — Events shorter than this threshold don't count toward host rewards.\n"
-        "**Min Voters** — Minimum vote submissions required to update host reputation.\n"
-        "**Income Multiplier** — Host earns this multiple of the standard participant reward.\n"
-        "**Rolling Window** — Number of recent events averaged to compute reputation score.\n"
-        "**Outlier Trim** — Votes above this per-event count are discarded to prevent brigading."
-    )
-    e2 = discord.Embed(title=_T_HO_G, description=desc_e2, color=_C_WHITE)
-
-    return [e1, e2]
-
-
-async def _vote_panel_embeds(i: discord.Interaction) -> list[discord.Embed]:
-    """Vote sub-panel — current scoring config + voting system guide."""
-    gid = str(i.guild_id)
-    window = await get_config_or_none(gid, "vote.window_minutes")
-    pos    = await get_config_or_none(gid, "vote.score_positive")
-    neu    = await get_config_or_none(gid, "vote.score_neutral")
-    neg    = await get_config_or_none(gid, "vote.score_negative")
-
-    desc_e1 = (
-        f"**Vote Window** — {_val(window, ' min')}\n"
-        f"**Score Positive** — {_val(pos, ' pts')}\n"
-        f"**Score Neutral** — {_val(neu, ' pts')}\n"
-        f"**Score Negative** — {_val(neg, ' pts')}"
-    )
-    e1 = discord.Embed(title=_T_VOTE, description=desc_e1, color=PRIMARY)
-
-    desc_e2 = (
-        "Voting opens immediately after an event ends and closes once the window expires.\n\n"
-        "**Vote Window** — Minutes the vote poll stays open after event close.\n"
-        "**Score Positive** — Reputation points added per 👍 vote.\n"
-        "**Score Neutral** — Reputation points added per 😐 vote.\n"
-        "**Score Negative** — Reputation points added per 👎 vote.\n\n"
-        "> Scores feed into the host's rolling reputation average.\n"
-        "> Lower scores don't lock a host out — they reduce priority and income multiplier."
-    )
-    e2 = discord.Embed(title=_T_VO_G, description=desc_e2, color=_C_WHITE)
-
-    return [e1, e2]
-
-
-async def _channel_panel_embeds(i: discord.Interaction) -> list[discord.Embed]:
-    """Channels sub-panel — current assignments + channel purpose guide."""
-    gid = str(i.guild_id)
-    gn_raw  = await get_config_or_none(gid, "channel.gamenight_id")
-    act_raw = await get_config_or_none(gid, "channel.activity_id")
-    vc_raw  = await get_config_or_none(gid, "channel.vc_category_id")
-
-    desc_e1 = (
-        f"**Gamenight** — {_ch(gn_raw)}\n"
-        f"**Activity** — {_ch(act_raw)}\n"
-        f"**VC Category** — {_ch(vc_raw)}"
-    )
-    e1 = discord.Embed(title=_T_CHANNEL, description=desc_e1, color=PRIMARY)
-
-    desc_e2 = (
-        "**Gamenight Channel** — Text channel for event announcements, join calls, and results.\n"
-        "**Activity Channel** — General notification feed: milestones, leaderboards, bot events.\n"
-        "**VC Category** — Voice category where temporary event rooms are created and destroyed.\n\n"
-        "> All three must be assigned for events to function correctly.\n"
-        "> Changes apply immediately — no restart required.\n"
-        "> Use the dropdowns below to select channels."
-    )
-    e2 = discord.Embed(title=_T_CH_G, description=desc_e2, color=_C_WHITE)
-
     return [e1, e2]
 
 
 async def _system_panel_embeds(i: discord.Interaction) -> list[discord.Embed]:
-    """System sub-panel — current bot state + state-change guide."""
-    gid   = str(i.guild_id)
-    state = await get_config_or_none(gid, "system.state") or "UNCONFIGURED"
+    gid      = str(i.guild_id)
+    state    = await get_config_or_none(gid, "system.state") or "UNCONFIGURED"
+    pt_name  = await get_config_or_none(gid, "system.point_name") or "points"
+    ar_raw   = await get_config_or_none(gid, "system.admin_role_id")
+    mr_raw   = await get_config_or_none(gid, "system.mod_role_id")
+    gn_raw   = await get_config_or_none(gid, "channel.gamenight_id")
+    act_raw  = await get_config_or_none(gid, "channel.activity_id")
+    vc_raw   = await get_config_or_none(gid, "channel.vc_category_id")
 
-    if state == "ACTIVE":
-        indicator = f"{TICK_ACTIVE} **ACTIVE**"
-    elif state == "PAUSED":
-        indicator = f"{ALERT_PAUSED} **PAUSED**"
-    else:
-        indicator = "🔴 **UNCONFIGURED**"
-
-    desc_e1 = (
-        f"Current state: {indicator}\n\n"
-        f"**▶️ ACTIVE** — All public-facing commands are enabled.\n"
-        f"**⏸️ PAUSED** — Public commands are blocked server-wide."
+    state_str = (
+        f"{TICK_ACTIVE} **ACTIVE**"  if state == "ACTIVE"  else
+        f"{ALERT_PAUSED} **PAUSED**" if state == "PAUSED"  else
+        "🔴 **UNCONFIGURED**"
     )
-    e1 = discord.Embed(title=_T_SYSTEM, description=desc_e1, color=WARNING)
-
-    desc_e2 = (
-        "**▶️ ACTIVE** — Users can join events, check balances, use the shop, and vote. Full functionality.\n"
-        "**⏸️ PAUSED** — `/shop`, `/gamenight`, and all user-facing commands are disabled globally. "
-        "Admin and owner commands remain fully operational.\n\n"
-        "> Use **PAUSED** during maintenance, data migrations, or economy resets\n"
-        "> to prevent race conditions with active users.\n"
-        "> A confirmation prompt is shown before any state change executes."
+    desc = (
+        f"**State:** {state_str}\n"
+        f"**Point Name:** `{pt_name}`\n\n"
+        f"**Admin Role:** {_format_role_ids(i.guild, ar_raw)}\n"
+        f"**Mod Role:** {_format_role_ids(i.guild, mr_raw)}\n\n"
+        f"**Gamenight:** {_ch(gn_raw)}\n"
+        f"**Activity:**  {_ch(act_raw)}\n"
+        f"**VC Category:** {_ch(vc_raw)}"
     )
-    e2 = discord.Embed(title=_T_SY_G, description=desc_e2, color=_C_WHITE)
+    guide = (
+        "**▶️ / ⏸️ Bot State** — Toggle ACTIVE / PAUSED with a confirmation gate.\n"
+        "**🏷️ Point Name** — Rename the in-server currency (e.g. coins, gems).\n"
+        "**📡 Channels** — Bind gamenight text channel, activity feed, and VC category.\n"
+        "**⚡ Force Action** — Direct balance manipulation. Mod+ only. Fully audited.\n"
+        "**👁️ View All** — Export full bot_config as a downloadable .txt file."
+    )
 
+    e1 = await _build_cms_embed(gid, "system",       _T_SYSTEM, PRIMARY, description=desc)
+    e2 = await _build_cms_embed(gid, "system_guide",  _T_SY_G,  _C_WHITE, fallback_desc=guide)
     return [e1, e2]
 
 
-async def _force_panel_embeds(_: discord.Interaction) -> list[discord.Embed]:
-    """Force sub-panel — action summary + usage guide."""
-    desc_e1 = (
-        "⚠️ Direct balance manipulation — bypasses all economy logic.\n"
-        "All force actions are permanent and recorded in the audit log.\n\n"
-        "**➕ Award** — Adds points directly to the target's raw balance.\n"
-        "**➖ Deduct** — Removes points. Fails gracefully if the user has no balance."
-    )
-    e1 = discord.Embed(title=_T_FORCE, description=desc_e1, color=WARNING)
+async def _point_panel_embeds(i: discord.Interaction) -> list[discord.Embed]:
+    """Unified Point panel — Economy settings + Decay zones in one view."""
+    gid        = str(i.guild_id)
+    join_b     = await get_config_or_none(gid, "ec.join_bonus")
+    comp_b     = await get_config_or_none(gid, "ec.completion_bonus")
+    max_b      = await get_config_or_none(gid, "ec.base_max_bonus")
+    mins_tick  = await get_config_or_none(gid, "ec.mins_per_tick")
+    pts_tick   = await get_config_or_none(gid, "ec.pts_per_tick")
+    grace      = await get_config_or_none(gid, "decay.grace_days")
+    zones_raw  = await get_config_or_none(gid, "decay.zones_config")
 
-    desc_e2 = (
-        "**Target** — Enter a numeric User ID or paste a @mention into the modal.\n"
-        "**Amount** — Must be a positive number. Decimals are supported (e.g. `12.5`).\n\n"
-        "> To get a User ID: right-click or long-press the user → **Copy User ID**.\n"
-        "> Deduct will not push a balance below zero — it fails with an error instead.\n"
-        "> This section is restricted to **Moderators** and above."
-    )
-    e2 = discord.Embed(title=_T_FO_G, description=desc_e2, color=_C_WHITE)
+    # Format zones for display
+    zones_display = "*(not configured)*"
+    if zones_raw:
+        try:
+            zones = json.loads(zones_raw)
+            if isinstance(zones, list) and zones:
+                lines = []
+                for z in sorted(zones, key=lambda x: x.get("zone_id", 0)):
+                    dur   = int(z.get("duration_days", -1))
+                    rate  = float(z.get("rate_per_day", 0))
+                    label = z.get("label", f"Zone {z.get('zone_id','?')}")
+                    dur_s = f"{dur}d" if dur != -1 else "∞"
+                    lines.append(f"> `{label}` — {dur_s} · {rate} pts/day")
+                zones_display = "\n".join(lines)
+        except (json.JSONDecodeError, TypeError):
+            pass
 
+    desc = (
+        "**── Event Economy ──**\n"
+        f"**Join Bonus**       — {_val(join_b,    ' pts')}\n"
+        f"**Event End Bonus**  — {_val(comp_b,    ' pts')}\n"
+        f"**Max Bonus Cap**    — {_val(max_b,     ' pts')}\n"
+        f"**Mins / Tick**      — {_val(mins_tick, ' min')}\n"
+        f"**Pts / Tick**       — {_val(pts_tick,  ' pts')}\n\n"
+        "**── Decay ──**\n"
+        f"**Grace Period** — {_val(grace, ' days')}\n"
+        f"**Zones:**\n{zones_display}"
+    )
+    guide = (
+        "**Join Bonus** — Points awarded the instant a user joins an event.\n"
+        "**Event End Bonus** — Bonus distributed when the host ends the event normally.\n"
+        "**Max Bonus Cap** — Hard ceiling on total per-event earnings.\n"
+        "**Event Math** — Set Mins/Tick, Pts/Tick, and Max Cap together in one modal.\n\n"
+        "**Grace Period** — Days of inactivity before any decay starts.\n"
+        "**Add Zone** — Append a new decay tier (label, duration, rate/day).\n"
+        "**Manage Zones** — Edit or delete existing decay zones via dropdown.\n\n"
+        "> Zone with `duration_days = -1` is terminal — it runs indefinitely.\n"
+        "> Any user activity resets the decay clock back to the grace period."
+    )
+
+    e1 = await _build_cms_embed(gid, "point",       _T_POINT, PRIMARY, description=desc)
+    e2 = await _build_cms_embed(gid, "point_guide",  _T_PT_G,  _C_WHITE, fallback_desc=guide)
     return [e1, e2]
 
 
-# =====
-# SHARED MODAL: AdminNumberModal
-# FIX-ADM-014: Accepts optional current_value — displayed in modal placeholder.
-# FIX-ADM-003: Error is ephemeral — panel remains usable after a failed submit.
-# =====
+async def _host_panel_embeds(i: discord.Interaction) -> list[discord.Embed]:
+    gid         = str(i.guild_id)
+    cooldown    = await get_config_or_none(gid, "host.cooldown_hours")
+    min_dur     = await get_config_or_none(gid, "host.min_duration_minutes")
+    auto_end    = await get_config_or_none(gid, "host.auto_end_tolerance_minutes")
+    income_mult = await get_config_or_none(gid, "host.income_multiplier")
+    rolling     = await get_config_or_none(gid, "host.rolling_window")
+
+    desc = (
+        f"**Cooldown**          — {_val(cooldown,    ' hours')}\n"
+        f"**Min Duration**      — {_val(min_dur,     ' min')}\n"
+        f"**Auto-End Tolerance** — {_val(auto_end,   ' min')}\n"
+        f"**Income Multiplier** — {_val(income_mult, '×')}\n"
+        f"**Rolling Window**    — {_val(rolling,     ' events')}"
+    )
+    guide = (
+        "**Cooldown** — Hours a host must wait before they can open another event.\n"
+        "**Min Duration** — Events shorter than this threshold earn no host rewards.\n"
+        "**Auto-End VC Tolerance** — Minutes of empty VC before the event auto-closes.\n"
+        "**Income Multiplier** — Host earns this multiple of the standard participant reward.\n"
+        "**Rolling Window** — Number of recent events averaged to compute reputation score."
+    )
+
+    e1 = await _build_cms_embed(gid, "host",       _T_HOST, PRIMARY, description=desc)
+    e2 = await _build_cms_embed(gid, "host_guide",  _T_HO_G, _C_WHITE, fallback_desc=guide)
+    return [e1, e2]
+
+
+async def _vote_panel_embeds(i: discord.Interaction) -> list[discord.Embed]:
+    gid        = str(i.guild_id)
+    min_voters = await get_config_or_none(gid, "host.min_voters")
+    outlier    = await get_config_or_none(gid, "host.outlier_trim_threshold")
+    window     = await get_config_or_none(gid, "vote.window_minutes")
+    pos        = await get_config_or_none(gid, "vote.score_positive")
+    neu        = await get_config_or_none(gid, "vote.score_neutral")
+    neg        = await get_config_or_none(gid, "vote.score_negative")
+
+    desc = (
+        f"**Min Voters**     — {_val(min_voters)}\n"
+        f"**Outlier Trim**   — {_val(outlier)}\n"
+        f"**Vote Window**    — {_val(window,  ' min')}\n\n"
+        f"**Score Positive** — {_val(pos, ' pts')}\n"
+        f"**Score Neutral**  — {_val(neu, ' pts')}\n"
+        f"**Score Negative** — {_val(neg, ' pts')}"
+    )
+    guide = (
+        "**Min Voters** — Minimum vote submissions required to update host reputation.\n"
+        "**Outlier Trim** — Votes beyond this count per event are discarded (anti-brigade).\n"
+        "**Vote Window** — Minutes the poll stays open after an event closes.\n"
+        "**Edit Scores** — Set all three vote weights (positive/neutral/negative) at once.\n\n"
+        "> Scores feed into the host's rolling reputation average.\n"
+        "> Lower scores reduce priority and income multiplier — they don't lock a host out."
+    )
+
+    e1 = await _build_cms_embed(gid, "vote",       _T_VOTE, PRIMARY, description=desc)
+    e2 = await _build_cms_embed(gid, "vote_guide",  _T_VO_G, _C_WHITE, fallback_desc=guide)
+    return [e1, e2]
+
+
+async def _shop_panel_embeds(i: discord.Interaction, item_count: int) -> list[discord.Embed]:
+    gid = str(i.guild_id)
+    desc = (
+        f"**Active Items:** `{item_count}`\n\n"
+        "Use **➕ Add New Item** to create a shop listing.\n"
+        "Use **📦 Manage Item** to edit or remove an existing item."
+    )
+    guide = (
+        "**➕ Add New Item** — Opens a modal to create a new item (name, description, cost, type).\n"
+        "**📦 Manage Item** — Dropdown of existing items; select one to open its control panel.\n"
+        "**🌌 Black Market** — Coming soon. Will configure BM rotation and slot count.\n\n"
+        "> Item types: `consumable`, `role`, `rental`, `permanent`\n"
+        "> `role` items automatically assign a Discord role on purchase.\n"
+        "> `rental` items expire after a configurable number of days."
+    )
+
+    e1 = await _build_cms_embed(gid, "shop",       _T_SHOP, PRIMARY, description=desc)
+    e2 = await _build_cms_embed(gid, "shop_guide",  _T_SH_G, _C_WHITE, fallback_desc=guide)
+    return [e1, e2]
+
+
+async def _item_control_embeds(i: discord.Interaction, item: dict) -> list[discord.Embed]:
+    gid = str(i.guild_id)
+    bm_str  = "✅ Yes" if item.get("is_blackmarket") else "❌ No"
+    act_str = "✅ Active" if item.get("is_active", True) else "🔴 Inactive"
+    dur_str = f"`{item['duration_days']}d`" if item.get("duration_days") else "*(N/A)*"
+
+    desc = (
+        f"**Item:** `{item['label']}`\n"
+        f"**Price:** `{item['cost']} pts`\n"
+        f"**Type:** `{item['item_type']}`\n"
+        f"**Duration:** {dur_str}\n"
+        f"**Black Market:** {bm_str}\n"
+        f"**Status:** {act_str}\n\n"
+        f"**Description:**\n{item.get('description') or '*(none)*'}"
+    )
+    guide = (
+        "**✏️ Edit Details** — Update name, description, price, and type.\n"
+        "**🎚️ Set Rarity** — Assign a rarity tier label to this item.\n"
+        "**🛒 Toggle Black Market** — Mark/unmark this item for BM rotation.\n"
+        "**🗑️ Delete Item** — Permanently remove this item from the shop.\n\n"
+        "> Deletion is irreversible — existing inventory entries are not affected."
+    )
+
+    e1 = await _build_cms_embed(gid, "item_control", _T_ITEM, PRIMARY, description=desc)
+    e2 = await _build_cms_embed(gid, "shop_guide",    _T_SH_G, _C_WHITE, fallback_desc=guide)
+    return [e1, e2]
+
+
+# =============================================================================
+# MODALS
+# =============================================================================
 
 class AdminNumberModal(discord.ui.Modal):
-    value_input = discord.ui.TextInput(label="New Value", placeholder="Enter a number...")
+    """Generic single-value numeric/text config modal. FIX-ADM-003 / FIX-ADM-014."""
+    value_input = discord.ui.TextInput(label="New Value", placeholder="Enter a value...")
 
     def __init__(self, key: str, title: str, placeholder: str, current_value: str | None = None):
         super().__init__(title=title[:45])
         self.cfg_key = key
-        if current_value is not None:
-            self.value_input.placeholder = f"Current: {current_value}  ·  {placeholder}"
-        else:
-            self.value_input.placeholder = placeholder
+        self.value_input.placeholder = (
+            f"Current: {current_value}  ·  {placeholder}" if current_value is not None else placeholder
+        )
 
-    async def on_submit(self, i: discord.Interaction):
+    async def on_submit(self, i: discord.Interaction) -> None:
         new_val = self.value_input.value.strip()
         try:
             await set_config(str(i.guild_id), self.cfg_key, new_val, str(i.user.id))
             await i.response.send_message(
-                embed=success_embed(f"`{self.cfg_key}` updated to `{new_val}`."),
-                ephemeral=True,
+                embed=success_embed(f"`{self.cfg_key}` updated to `{new_val}`."), ephemeral=True
             )
         except Exception as exc:
             await i.response.send_message(
-                embed=error_embed(f"Failed to update `{self.cfg_key}`:\n`{exc}`"),
-                ephemeral=True,
+                embed=error_embed(f"Failed to update `{self.cfg_key}`:\n`{exc}`"), ephemeral=True
             )
 
 
-async def _open_number_modal(
-    i: discord.Interaction,
-    key: str,
-    title: str,
-    placeholder: str,
-) -> None:
-    """Fetches current value then opens the modal with an informative placeholder."""
-    current = await get_config_or_none(str(i.guild_id), key)
-    await i.response.send_modal(
-        AdminNumberModal(key, title, placeholder, current_value=current)
-    )
+class EventMathModal(discord.ui.Modal, title="Event Math Settings"):
+    """Captures Mins/Tick, Pts/Tick, and Max Cap in a single modal submit."""
+    mins_tick = discord.ui.TextInput(label="Mins / Tick",  placeholder="Minutes per earning tick, e.g. 10")
+    pts_tick  = discord.ui.TextInput(label="Pts / Tick",   placeholder="Points awarded per tick, e.g. 5")
+    max_cap   = discord.ui.TextInput(label="Max Cap",      placeholder="Max earnable pts per event, e.g. 50")
 
+    async def on_submit(self, i: discord.Interaction) -> None:
+        gid = str(i.guild_id)
+        uid = str(i.user.id)
+        errors: list[str] = []
 
-# =====
-# ECONOMY SETTINGS VIEW
-# =====
-
-class AdminEconomyView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-        self.message: discord.Message | None = None
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        if self.message:
+        async def _save(key: str, raw: str) -> None:
+            val = raw.strip()
+            if not val:
+                return
             try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
+                float(val)  # Validate numeric
+                await set_config(gid, key, val, uid)
+            except ValueError:
+                errors.append(f"`{key}` — `{val}` is not a valid number.")
+            except Exception as exc:
+                errors.append(f"`{key}` — {exc}")
 
-    @discord.ui.button(label="Join Bonus", style=discord.ButtonStyle.secondary)
-    async def join_bonus(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "ec.join_bonus", "Join Bonus (pts)", "e.g. 15")
+        await _save("ec.mins_per_tick",   self.mins_tick.value)
+        await _save("ec.pts_per_tick",    self.pts_tick.value)
+        await _save("ec.base_max_bonus",  self.max_cap.value)
 
-    @discord.ui.button(label="Completion Bonus", style=discord.ButtonStyle.secondary)
-    async def comp_bonus(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "ec.completion_bonus", "Completion Bonus (pts)", "e.g. 10")
-
-    @discord.ui.button(label="Max Bonus", style=discord.ButtonStyle.secondary)
-    async def max_bonus(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "ec.base_max_bonus", "Max Bonus (pts)", "e.g. 50")
-
-    @discord.ui.button(label="Time Cap (min)", style=discord.ButtonStyle.secondary)
-    async def t_cap(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "ec.t_cap", "Time Cap (minutes)", "e.g. 120")
-
-    @discord.ui.button(label="← Back", style=discord.ButtonStyle.secondary, row=1)
-    async def back(self, i: discord.Interaction, _: discord.ui.Button):
-        embeds = await _main_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminMainView())
+        if errors:
+            await i.response.send_message(
+                embed=error_embed("Some values failed to save:\n" + "\n".join(errors)), ephemeral=True
+            )
+        else:
+            await i.response.send_message(
+                embed=success_embed("Event math settings updated successfully."), ephemeral=True
+            )
 
 
-# =====
-# DECAY SETTINGS VIEW
-# FIX-ADM-009: Correctly labelled — was previously mislabelled "Tiers".
-# =====
+class AddZoneModal(discord.ui.Modal, title="Add Decay Zone"):
+    """Creates a new entry in the decay.zones_config JSON array."""
+    label_in = discord.ui.TextInput(label="Zone Label",     placeholder="e.g. Zone 4")
+    dur_in   = discord.ui.TextInput(label="Duration (days, -1 = infinite)", placeholder="e.g. 14  or  -1")
+    rate_in  = discord.ui.TextInput(label="Rate (pts/day)", placeholder="e.g. 25.0")
 
-class AdminDecayView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-        self.message: discord.Message | None = None
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
-
-    @discord.ui.button(label="Grace Days", style=discord.ButtonStyle.secondary)
-    async def grace(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "decay.grace_days", "Grace Days", "Days before decay starts (e.g. 7)")
-
-    @discord.ui.button(label="Zone 1 Days", style=discord.ButtonStyle.secondary)
-    async def z1(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "decay.zone1_days", "Zone 1 Days", "Slow decay zone duration (e.g. 7)")
-
-    @discord.ui.button(label="Zone 2 Days", style=discord.ButtonStyle.secondary)
-    async def z2(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "decay.zone2_days", "Zone 2 Days", "Medium decay zone duration (e.g. 7)")
-
-    @discord.ui.button(label="Rate Zone 1", style=discord.ButtonStyle.secondary, row=1)
-    async def r1(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "decay.rate_zone1", "Rate Zone 1 (pts/day)", "e.g. 5.0")
-
-    @discord.ui.button(label="Rate Zone 2", style=discord.ButtonStyle.secondary, row=1)
-    async def r2(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "decay.rate_zone2", "Rate Zone 2 (pts/day)", "e.g. 15.0")
-
-    @discord.ui.button(label="Rate Zone 3", style=discord.ButtonStyle.secondary, row=1)
-    async def r3(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "decay.rate_zone3", "Rate Zone 3 (pts/day)", "e.g. 30.0")
-
-    @discord.ui.button(label="← Back", style=discord.ButtonStyle.secondary, row=2)
-    async def back(self, i: discord.Interaction, _: discord.ui.Button):
-        embeds = await _main_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminMainView())
-
-
-# =====
-# HOST SETTINGS VIEW
-# FIX-ADM-011: Full UI coverage for host.* config keys.
-# =====
-
-class AdminHostView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-        self.message: discord.Message | None = None
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
-
-    @discord.ui.button(label="Cooldown (hours)", style=discord.ButtonStyle.secondary)
-    async def cooldown(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "host.cooldown_hours", "Host Cooldown (hours)", "e.g. 12")
-
-    @discord.ui.button(label="Min Duration (min)", style=discord.ButtonStyle.secondary)
-    async def min_dur(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "host.min_duration_minutes", "Min Duration (minutes)", "e.g. 45")
-
-    @discord.ui.button(label="Min Voters", style=discord.ButtonStyle.secondary)
-    async def min_voters(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "host.min_voters", "Minimum Voters", "e.g. 5")
-
-    @discord.ui.button(label="Income Multiplier", style=discord.ButtonStyle.secondary)
-    async def income_mult(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "host.income_multiplier", "Host Income Multiplier", "e.g. 2.0")
-
-    @discord.ui.button(label="Rolling Window", style=discord.ButtonStyle.secondary, row=1)
-    async def rolling(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "host.rolling_window", "Reputation Rolling Window (events)", "e.g. 10")
-
-    @discord.ui.button(label="Outlier Trim", style=discord.ButtonStyle.secondary, row=1)
-    async def outlier(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "host.outlier_trim_threshold", "Outlier Trim Threshold", "e.g. 8")
-
-    @discord.ui.button(label="← Back", style=discord.ButtonStyle.secondary, row=2)
-    async def back(self, i: discord.Interaction, _: discord.ui.Button):
-        embeds = await _main_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminMainView())
-
-
-# =====
-# VOTE SETTINGS VIEW
-# FIX-ADM-011: Full UI coverage for vote.* config keys.
-# =====
-
-class AdminVoteView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-        self.message: discord.Message | None = None
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
-
-    @discord.ui.button(label="Vote Window (min)", style=discord.ButtonStyle.secondary)
-    async def window(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "vote.window_minutes", "Vote Window (minutes)", "e.g. 10")
-
-    @discord.ui.button(label="Score Positive", style=discord.ButtonStyle.secondary)
-    async def pos(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "vote.score_positive", "Positive Vote Score", "e.g. 5")
-
-    @discord.ui.button(label="Score Neutral", style=discord.ButtonStyle.secondary)
-    async def neu(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "vote.score_neutral", "Neutral Vote Score", "e.g. 3")
-
-    @discord.ui.button(label="Score Negative", style=discord.ButtonStyle.secondary)
-    async def neg(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "vote.score_negative", "Negative Vote Score", "e.g. 1")
-
-    @discord.ui.button(label="← Back", style=discord.ButtonStyle.secondary, row=1)
-    async def back(self, i: discord.Interaction, _: discord.ui.Button):
-        embeds = await _main_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminMainView())
-
-
-# =====
-# CHANNEL SETTINGS VIEW
-# FIX-ADM-005: callback() defers before DB write to avoid timeouts.
-# =====
-
-class AdminChannelSel(discord.ui.ChannelSelect):
-    def __init__(self, key: str, placeholder: str, ctype: list):
-        self.cfg_key = key
-        super().__init__(placeholder=placeholder, channel_types=ctype, min_values=1, max_values=1)
-
-    async def callback(self, i: discord.Interaction):
-        # FIX-ADM-005: Defer first before DB write.
-        await i.response.defer()
+    async def on_submit(self, i: discord.Interaction) -> None:
+        gid = str(i.guild_id)
         try:
-            await set_config(str(i.guild_id), self.cfg_key, str(self.values[0].id), str(i.user.id))
-            await i.edit_original_response(
-                embed=success_embed(f"`{self.cfg_key}` updated to <#{self.values[0].id}>!"),
-                view=self.view,
-            )
-        except Exception as exc:
-            await i.edit_original_response(
-                embed=error_embed(f"Failed to update `{self.cfg_key}`:\n`{exc}`"),
-                view=self.view,
-            )
-
-
-class AdminChannelGroupView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-        self.message: discord.Message | None = None
-        self.add_item(AdminChannelSel("channel.gamenight_id", "🎮 Gamenight Channel...", [discord.ChannelType.text]))
-        self.add_item(AdminChannelSel("channel.activity_id",  "📢 Activity Channel...",  [discord.ChannelType.text]))
-        self.add_item(AdminChannelSel("channel.vc_category_id", "🔊 VC Category...",     [discord.ChannelType.category]))
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
-
-    @discord.ui.button(label="← Back", style=discord.ButtonStyle.secondary, row=4)
-    async def back(self, i: discord.Interaction, _: discord.ui.Button):
-        embeds = await _main_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminMainView())
-
-
-# =====
-# SYSTEM SETTINGS VIEW
-# FIX-ADM-004: State changes require ConfirmSystemStateView before execution.
-# FIX-ADM-006: set_active/set_paused defer before DB write.
-# =====
-
-class ConfirmSystemStateView(discord.ui.View):
-    """Confirmation gate before committing a system state change."""
-
-    def __init__(self, target_state: str):
-        super().__init__(timeout=60)
-        self.target_state = target_state
-        self.message: discord.Message | None = None
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
-
-    @discord.ui.button(label="✅ Yes, Confirm", style=discord.ButtonStyle.danger)
-    async def confirm(self, i: discord.Interaction, _: discord.ui.Button):
-        await i.response.defer()
-        try:
-            await set_config(str(i.guild_id), "system.state", self.target_state, str(i.user.id))
-            icon = "🟢" if self.target_state == "ACTIVE" else "🟡"
-            await i.edit_original_response(
-                embed=success_embed(f"System state changed to {icon} **{self.target_state}**."),
-                view=None,
-            )
-        except Exception as exc:
-            await i.edit_original_response(
-                embed=error_embed(f"Failed to change system state:\n`{exc}`"),
-                view=None,
-            )
-
-    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
-    async def cancel(self, i: discord.Interaction, _: discord.ui.Button):
-        await i.response.edit_message(
-            embed=discord.Embed(description="State change cancelled.", color=PRIMARY),
-            view=None,
-        )
-
-
-class AdminSystemView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-        self.message: discord.Message | None = None
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
-
-    @discord.ui.button(label="▶️ Set ACTIVE", style=discord.ButtonStyle.success)
-    async def set_active(self, i: discord.Interaction, _: discord.ui.Button):
-        e = confirm_embed(
-            "Confirmation: Set ACTIVE",
-            "The bot will start accepting public commands again.\n"
-            "Ensure all configurations are correct before activating.",
-        )
-        view = ConfirmSystemStateView("ACTIVE")
-        await i.response.edit_message(embed=e, view=view)
-
-    @discord.ui.button(label="⏸️ Set PAUSED", style=discord.ButtonStyle.secondary)
-    async def set_paused(self, i: discord.Interaction, _: discord.ui.Button):
-        e = confirm_embed(
-            "Confirmation: Set PAUSED",
-            "The bot will stop serving public commands (`/shop`, `/gamenight`, etc).\n"
-            "Admin and owner commands will still work.",
-            warning="Currently active users will not be able to start new events.",
-        )
-        view = ConfirmSystemStateView("PAUSED")
-        await i.response.edit_message(embed=e, view=view)
-
-    @discord.ui.button(label="← Back", style=discord.ButtonStyle.secondary, row=1)
-    async def back(self, i: discord.Interaction, _: discord.ui.Button):
-        embeds = await _main_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminMainView())
-
-
-# =====
-# FORCE POINTS VIEW
-# FIX-ADM-008: ID parsing fixed from lstrip (char-set) to re.sub (pattern).
-# =====
-
-class ForcePointsModal(discord.ui.Modal):
-    user_input   = discord.ui.TextInput(label="User ID or @mention", placeholder="e.g. 123456789012345678 or @User")
-    amount_input = discord.ui.TextInput(label="Point Amount",        placeholder="e.g. 100")
-
-    def __init__(self, action: str):
-        super().__init__(title=f"Force {'Award' if action == 'award' else 'Deduct'} Points")
-        self.action = action
-
-    async def on_submit(self, i: discord.Interaction):
-        # FIX-ADM-008: re.sub strips mention syntax robustly.
-        uid_raw = re.sub(r"[<@!>]", "", self.user_input.value.strip())
-        try:
-            amount = float(self.amount_input.value.strip())
-            uid    = str(int(uid_raw))
+            dur  = int(self.dur_in.value.strip())
+            rate = float(self.rate_in.value.strip())
         except ValueError:
             return await i.response.send_message(
-                embed=error_embed(
-                    "Invalid User ID or amount.\n"
-                    "Enter a numeric User ID or a mention like `@Username`."
-                ),
-                ephemeral=True,
+                embed=error_embed("Duration must be an integer; Rate must be a number."), ephemeral=True
             )
 
-        if amount <= 0:
-            return await i.response.send_message(
-                embed=error_embed("Amount must be greater than 0."),
-                ephemeral=True,
-            )
-
-        gid = str(i.guild_id)
-        if self.action == "award":
-            await award(gid, uid, amount)
-            await i.response.send_message(
-                embed=success_embed(f"Awarded **{amount:.0f} pts** to <@{uid}>."),
-                ephemeral=True,
-            )
-        else:
-            ok = await deduct(gid, uid, amount)
-            if ok:
-                await i.response.send_message(
-                    embed=success_embed(f"Deducted **{amount:.0f} pts** from <@{uid}>."),
-                    ephemeral=True,
-                )
-            else:
-                await i.response.send_message(
-                    embed=error_embed(f"User <@{uid}> not found or has no points."),
-                    ephemeral=True,
-                )
-
-
-class AdminForceView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-        self.message: discord.Message | None = None
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
-
-    @discord.ui.button(label="➕ Award Points",  style=discord.ButtonStyle.success)
-    async def award_pts(self, i: discord.Interaction, _: discord.ui.Button):
-        await i.response.send_modal(ForcePointsModal("award"))
-
-    @discord.ui.button(label="➖ Deduct Points", style=discord.ButtonStyle.danger)
-    async def deduct_pts(self, i: discord.Interaction, _: discord.ui.Button):
-        await i.response.send_modal(ForcePointsModal("deduct"))
-
-    @discord.ui.button(label="← Back", style=discord.ButtonStyle.secondary, row=1)
-    async def back(self, i: discord.Interaction, _: discord.ui.Button):
-        embeds = await _main_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminMainView())
-
-
-# =====
-# MAIN PANEL VIEW
-# =====
-
-class AdminMainView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-        self.message: discord.Message | None = None
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        # FIX-ADM-007: Edit Discord message on timeout so buttons don't ghost.
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
-
-    @discord.ui.button(label="⚙️ Economy", style=discord.ButtonStyle.secondary, row=0)
-    async def b1(self, i: discord.Interaction, _: discord.ui.Button):
-        embeds = await _economy_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminEconomyView())
-
-    @discord.ui.button(label="⏱️ Decay", style=discord.ButtonStyle.secondary, row=0)
-    async def b2(self, i: discord.Interaction, _: discord.ui.Button):
-        embeds = await _decay_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminDecayView())
-
-    @discord.ui.button(label="🎮 Host", style=discord.ButtonStyle.secondary, row=0)
-    async def b3(self, i: discord.Interaction, _: discord.ui.Button):
-        embeds = await _host_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminHostView())
-
-    @discord.ui.button(label="🗳️ Vote", style=discord.ButtonStyle.secondary, row=0)
-    async def b4(self, i: discord.Interaction, _: discord.ui.Button):
-        embeds = await _vote_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminVoteView())
-
-    @discord.ui.button(label="📡 Channels", style=discord.ButtonStyle.secondary, row=1)
-    async def b5(self, i: discord.Interaction, _: discord.ui.Button):
-        embeds = await _channel_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminChannelGroupView())
-
-    @discord.ui.button(label="👁️ View All", style=discord.ButtonStyle.primary, row=1)
-    async def b6(self, i: discord.Interaction, _: discord.ui.Button):
-        await i.response.defer(ephemeral=True)
-        all_cfg = await get_all_config(str(i.guild_id))
-        lines   = [f"{k}: {v}" for k, v in sorted(all_cfg.items())]
-        txt     = "\n".join(lines)
-        file    = discord.File(io.BytesIO(txt.encode()), filename="config_dump.txt")
-        await i.followup.send(
-            content=f"📄 Configuration dump — {len(lines)} keys:",
-            file=file,
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="🔧 System", style=discord.ButtonStyle.danger, row=1)
-    async def b8(self, i: discord.Interaction, _: discord.ui.Button):
-        embeds = await _system_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminSystemView())
-
-    @discord.ui.button(label="⚡ Force", style=discord.ButtonStyle.danger, row=1)
-    async def b9(self, i: discord.Interaction, _: discord.ui.Button):
-        # FIX-ADM-012: Explicit guard check — does not rely on require_mod side-effect.
-        if not await require_mod(i):
-            return
-        embeds = await _force_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminForceView())
-
-
-# =====
-# DISCORD COG MOUNTING
-# =====
-
-class AdminCog(commands.Cog):
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-
-    @app_commands.command(name="admin", description="Administrator control panel.")
-    async def admin_cmd(self, i: discord.Interaction):
-        if not await require_admin(i):
-            return
-
-        gid   = str(i.guild_id)
-        state = await get_config_or_none(gid, "system.state")
-
-        if not state or state == "UNCONFIGURED":
-            # Auto-initialize with Balanced preset. Channels are configured
-            # post-init via the 📡 Channels button.
-            await i.response.defer(ephemeral=True)
-            try:
-                preset_data = dict(PRESETS["balanced"])
-                preset_data["system.state"]      = "ACTIVE"
-                preset_data["system.guild_name"] = i.guild.name
-                await bulk_set_config(gid, preset_data, str(i.user.id))
-                logger.info(f"[Admin] Guild {gid} auto-initialized with Balanced preset by {i.user.id}.")
-            except Exception:
-                logger.exception(f"[Admin] Auto-init failed for guild {gid}.")
-                await i.followup.send(
-                    embed=error_embed("Failed to initialize bot configuration. Check logs."),
-                    ephemeral=True,
-                )
-                return
-
-            welcome = discord.Embed(title="🌕  Welcome to Two Moon!", color=0x57F287)
-            welcome.description = (
-                "The bot has been initialized with the **Balanced** preset and is now **ACTIVE**.\n\n"
-                "**Next steps:**\n"
-                "• Set your channels via **📡 Channels** — required for events to function.\n"
-                "• Configure access roles via `/owner` → **🔑 Admin Set**.\n"
-                "• Fine-tune economy, decay, and host settings using the buttons below."
-            )
-            welcome.set_footer(text="All values can be changed anytime from this panel.")
-            main_view = AdminMainView()
-            await i.followup.send(embed=welcome, view=main_view, ephemeral=True)
-            main_view.message = await i.original_response()
-        else:
-            embeds    = await _main_panel_embeds(i)
-            main_view = AdminMainView()
-            await i.response.send_message(embeds=embeds, view=main_view, ephemeral=True)
-            # FIX-ADM-007: Store message reference for on_timeout.
-            main_view.message = await i.original_response()
-
-
-async def setup(bot: commands.Bot):
-    await bot.add_cog(AdminCog(bot))
-
-# =====
-# MODULE: cogs/admin.py
-# =====
-# Architecture Overview:
-# Administrator Control Panel. Handles day-to-day management: economy parameters,
-# game channels, point adjustments, and system state toggling.
-#
-# Every config change is written to 'config_audit_log' for a full paper trail.
-#
-# UI ARCHITECTURE:
-# Every panel (main + all sub-panels) renders as two stacked embeds per message:
-#   Embed 1 — State card: current live values, roles, last audit entry.
-#   Embed 2 — Guide card: concise description of each button/setting.
-# Main panel carries Asset Server GIF thumbnails. Sub-panels omit thumbnails.
-# Emoji constants and thumbnail URLs live in utils/emojis.py.
-#
-# CHANGELOG:
-# FIX-ADM-001: Race condition in Setup Wizard — SELECT FOR UPDATE per guild.
-# FIX-ADM-002: Draft delete not atomic — DELETE now in same tx as bulk_set_config.
-# FIX-ADM-003: AdminNumberModal returned error without keeping panel alive — fixed.
-# FIX-ADM-004: Set ACTIVE/PAUSED now requires ConfirmSystemStateView.
-# FIX-ADM-005: AdminChannelSel.callback() defers before DB write.
-# FIX-ADM-006: set_active/set_paused now defer before edit.
-# FIX-ADM-007: All Views store message ref and call edit on timeout.
-# FIX-ADM-008: ForcePointsModal ID parsing replaced lstrip with re.sub.
-# FIX-ADM-009: Decay view label corrected from "Tiers" to "Decay".
-# FIX-ADM-010: _format_role_ids deduplicated — single shared implementation.
-# FIX-ADM-011: AdminDecayView, AdminHostView, AdminVoteView added.
-# FIX-ADM-012: require_mod guard in b9 uses explicit defer.
-# FIX-ADM-013: Setup Wizard preset descriptions added (wizard later removed).
-# FIX-ADM-014: AdminNumberModal shows current value in placeholder.
-# REFACTOR-ADM-015: Full UI overhaul — dual-embed layout, small-caps titles,
-#                   per-section current-value display, consistent colour palette,
-#                   last-audit-entry preview in main panel header.
-# =====
-
-import io
-import json
-import logging
-import re
-
-import discord
-from discord import app_commands
-from discord.ext import commands
-
-from config.defaults import PRESETS
-from config.manager import (
-    bulk_set_config,
-    get_all_config,
-    get_config_or_none,
-    set_config,
-)
-from db.pool import get_pool
-from economy.points import award, deduct
-from guards.checks import require_admin, require_mod
-from utils.embeds import ERROR, PRIMARY, WARNING, confirm_embed, error_embed, success_embed
-from utils.emojis import ALERT_PAUSED, TICK_ACTIVE, THUMBNAIL_ADMIN, THUMBNAIL_NAV
-from utils.paginator import Paginator, build_pages
-from utils.time import format_relative
-
-logger = logging.getLogger(__name__)
-
-
-# =====
-# PANEL CONSTANTS
-# =====
-
-# Small-cap Unicode section titles
-_T_ADMIN   = "ᴀᴅᴍɪɴ ᴄᴏɴᴛʀᴏʟ"
-_T_NAV     = "ɴᴀᴠɪɢᴀᴛɪᴏɴ ɢᴜɪᴅᴇ"
-_T_ECONOMY = "⚙️ ᴇᴄᴏɴᴏᴍʏ"
-_T_EC_G    = "⚙️ ᴇᴄᴏɴᴏᴍʏ ɢᴜɪᴅᴇ"
-_T_DECAY   = "⏱️ ᴅᴇᴄᴀʏ"
-_T_DC_G    = "⏱️ ᴅᴇᴄᴀʏ ɢᴜɪᴅᴇ"
-_T_HOST    = "🎮 ʜᴏꜱᴛ"
-_T_HO_G    = "🎮 ʜᴏꜱᴛ ɢᴜɪᴅᴇ"
-_T_VOTE    = "🗳️ ᴠᴏᴛᴇ"
-_T_VO_G    = "🗳️ ᴠᴏᴛᴇ ɢᴜɪᴅᴇ"
-_T_CHANNEL = "📡 ᴄʜᴀɴɴᴇʟꜱ"
-_T_CH_G    = "📡 ᴄʜᴀɴɴᴇʟ ɢᴜɪᴅᴇ"
-_T_SYSTEM  = "🔧 ꜱʏꜱᴛᴇᴍ"
-_T_SY_G    = "🔧 ꜱʏꜱᴛᴇᴍ ɢᴜɪᴅᴇ"
-_T_FORCE   = "⚡ ꜰᴏʀᴄᴇ"
-_T_FO_G    = "⚡ ꜰᴏʀᴄᴇ ɢᴜɪᴅᴇ"
-
-# Accent colours (main panel only — sub-panels use PRIMARY / WHITE)
-_C_RED   = 0xFF0000
-_C_WHITE = 0xFFFFFF
-
-
-# =====
-# SHARED UTILITY FUNCTIONS
-# =====
-
-def _format_role_ids(guild: discord.Guild, raw_val: str | None) -> str:
-    """
-    Parses both legacy single-ID strings and modern JSON arrays into role mentions.
-    FIX-ADM-010: Single shared implementation — owner.py should import this.
-    """
-    if not raw_val or raw_val in ("null", "[]"):
-        return "*(not set)*"
-    try:
-        ids = json.loads(raw_val)
-        if not isinstance(ids, list):
-            ids = [ids]
-    except (json.JSONDecodeError, TypeError):
-        ids = [raw_val]
-
-    mentions = []
-    for rid in ids:
-        role = guild.get_role(int(rid)) if str(rid).isdigit() else None
-        mentions.append(role.mention if role else f"*(unknown: {rid})*")
-    return ", ".join(mentions) if mentions else "*(not set)*"
-
-
-def _val(raw: str | None, suffix: str = "") -> str:
-    """
-    Formats a raw config value for display.
-    Returns backtick-wrapped value+suffix, or *(not set)* when absent.
-    """
-    if not raw or raw in ("null", "[]", ""):
-        return "*(not set)*"
-    return f"`{raw}{suffix}`"
-
-
-def _ch(raw: str | None) -> str:
-    """Formats a channel/category ID as a Discord mention."""
-    return f"<#{raw}>" if raw else "*(not set)*"
-
-
-# =====
-# PANEL EMBED BUILDERS
-# Each builder is async and returns [embed_state, embed_guide].
-# CMS INTEGRATION: Fetches embed templates from database with fallback to hardcoded defaults.
-# =====
-
-async def _get_embed_config(guild_id: str, key: str) -> dict | None:
-    """Fetch an embed configuration from the database."""
-    try:
-        raw = await get_config_or_none(guild_id, key)
+        raw = await get_config_or_none(gid, "decay.zones_config")
+        zones: list[dict] = []
         if raw:
-            return json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        pass
-    return None
+            try:
+                zones = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                zones = []
+
+        next_id = max((z.get("zone_id", 0) for z in zones), default=0) + 1
+        zones.append({
+            "zone_id":      next_id,
+            "label":        self.label_in.value.strip() or f"Zone {next_id}",
+            "duration_days": dur,
+            "rate_per_day": rate,
+        })
+
+        try:
+            await set_config(gid, "decay.zones_config", json.dumps(zones), str(i.user.id))
+            await i.response.send_message(
+                embed=success_embed(f"Zone `{zones[-1]['label']}` added successfully."), ephemeral=True
+            )
+        except Exception as exc:
+            await i.response.send_message(
+                embed=error_embed(f"Failed to save zone:\n`{exc}`"), ephemeral=True
+            )
 
 
-async def _main_panel_embeds(i: discord.Interaction) -> list[discord.Embed]:
-    """Main admin panel — two embeds: status card + navigation guide."""
-    gid    = str(i.guild_id)
+class EditZoneModal(discord.ui.Modal):
+    """Edits duration_days and rate_per_day of an existing zone in-place."""
+    dur_in  = discord.ui.TextInput(label="New Duration (days, -1 = infinite)", placeholder="e.g. 14")
+    rate_in = discord.ui.TextInput(label="New Rate (pts/day)", placeholder="e.g. 20.0")
 
-    # Try to fetch CMS embed configs first
-    main_cfg = await _get_embed_config(gid, "embed.admin.main")
-    guide_cfg = await _get_embed_config(gid, "embed.admin.main_guide")
+    def __init__(self, zone_id: int):
+        super().__init__(title=f"Edit Zone {zone_id}")
+        self.zone_id = zone_id
 
-    ar_raw = await get_config_or_none(gid, "system.admin_role_id")
-    mr_raw = await get_config_or_none(gid, "system.mod_role_id")
+    async def on_submit(self, i: discord.Interaction) -> None:
+        gid = str(i.guild_id)
+        try:
+            new_dur  = int(self.dur_in.value.strip())
+            new_rate = float(self.rate_in.value.strip())
+        except ValueError:
+            return await i.response.send_message(
+                embed=error_embed("Duration must be an integer; Rate must be a number."), ephemeral=True
+            )
 
-    ar_display = _format_role_ids(i.guild, ar_raw)
-    mr_display = _format_role_ids(i.guild, mr_raw)
+        raw = await get_config_or_none(gid, "decay.zones_config")
+        try:
+            zones: list[dict] = json.loads(raw) if raw else []
+        except (json.JSONDecodeError, TypeError):
+            zones = []
 
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        last_audit = await conn.fetchrow(
-            """
-            SELECT changed_by, config_key, new_value, changed_at
-            FROM config_audit_log WHERE guild_id=$1
-            ORDER BY changed_at DESC LIMIT 1
-            """,
-            gid,
-        )
+        updated = False
+        for z in zones:
+            if int(z.get("zone_id", -99)) == self.zone_id:
+                z["duration_days"] = new_dur
+                z["rate_per_day"]  = new_rate
+                updated = True
+                break
 
-    # Last-edit footer: shows who edited and exactly which key changed.
-    audit_line = ""
-    if last_audit:
-        relative = format_relative(last_audit["changed_at"])
-        key      = last_audit["config_key"]
-        new_val  = str(last_audit["new_value"] or "—")
-        if len(new_val) > 40:
-            new_val = new_val[:37] + "..."
-        audit_line = (
-            f"\n-# Edited {relative} by <@{last_audit['changed_by']}>\n"
-            f"> -# {key} → {new_val}"
-        )
+        if not updated:
+            return await i.response.send_message(
+                embed=error_embed(f"Zone ID `{self.zone_id}` not found."), ephemeral=True
+            )
 
-    # Determine state indicator
-    state = await get_config_or_none(gid, "system.state") or "UNCONFIGURED"
-    state_indicator = TICK_ACTIVE if state == "ACTIVE" else ALERT_PAUSED if state == "PAUSED" else "🔴"
-
-    # Build description with dynamic values
-    desc_e1 = (
-        f"**{state_indicator} {state}**\n"
-        f"### Authorization:\n"
-        f"**Admin:**\n> {ar_display}\n\n"
-        f"**Mod:**\n> {mr_display}"
-        f"{audit_line}"
-    )
-
-    # Use CMS config or fallback to defaults
-    if main_cfg:
-        e1_desc = main_cfg.get("description", "").format(
-            state_indicator=state_indicator,
-            state=state,
-            admin_roles=ar_display,
-            mod_roles=mr_display,
-            audit_line=audit_line
-        )
-        e1 = discord.Embed(
-            title=main_cfg.get("title", _T_ADMIN),
-            description=e1_desc,
-            color=main_cfg.get("color", _C_RED)
-        )
-        if main_cfg.get("thumbnail"):
-            e1.set_thumbnail(url=main_cfg["thumbnail"])
-    else:
-        e1 = discord.Embed(title=_T_ADMIN, description=desc_e1, color=_C_RED)
-        e1.set_thumbnail(url=THUMBNAIL_ADMIN)
-
-    desc_e2 = (
-        "⚙️ Economy\n"
-        "> Award rates for joining & completing events.\n"
-        "> Tune join bonus, completion bonus, point cap,\n"
-        "> and the time window counted toward scaling.\n\n"
-        "⏱️ Decay\n"
-        "> Controls how quickly idle users lose points.\n"
-        "> Set grace period, three zone durations,\n"
-        "> and the per-day loss rate for each zone.\n\n"
-        "🎮 Host\n"
-        "> Rules governing who can host and how often.\n"
-        "> Cooldown, min duration, voter threshold,\n"
-        "> income multiplier, and reputation window.\n\n"
-        "🗳️ Vote\n"
-        "> Post-event host reputation system.\n"
-        "> Configure the voting window and the score\n"
-        "> weight assigned to each vote type.\n\n"
-        "📡 Channels\n"
-        "> Bind bot features to specific channels.\n"
-        "> Gamenight text, activity feed,\n"
-        "> and the VC category for event rooms.\n\n"
-        "👁️ View All\n"
-        "> Export every config key to a .txt file.\n"
-        "> Useful for auditing, backup review,\n"
-        "> or diagnosing unexpected bot behaviour.\n\n"
-        "🔧 System\n"
-        "> Master on/off switch for the bot.\n"
-        "> ACTIVE enables all public commands;\n"
-        "> PAUSED blocks them while admin still works.\n\n"
-        "⚡ Force\n"
-        "> Direct point balance manipulation. Mod+ only.\n"
-        "> Award or deduct any amount from any user\n"
-        "> by entering their ID or @mention."
-    )
-
-    if guide_cfg:
-        e2 = discord.Embed(
-            title=guide_cfg.get("title", _T_NAV),
-            description=guide_cfg.get("description", desc_e2),
-            color=guide_cfg.get("color", _C_WHITE)
-        )
-        if guide_cfg.get("thumbnail"):
-            e2.set_thumbnail(url=guide_cfg["thumbnail"])
-    else:
-        e2 = discord.Embed(title=_T_NAV, description=desc_e2, color=_C_WHITE)
-        e2.set_thumbnail(url=THUMBNAIL_NAV)
-
-    return [e1, e2]
+        try:
+            await set_config(gid, "decay.zones_config", json.dumps(zones), str(i.user.id))
+            await i.response.send_message(
+                embed=success_embed(f"Zone `{self.zone_id}` updated."), ephemeral=True
+            )
+        except Exception as exc:
+            await i.response.send_message(
+                embed=error_embed(f"Failed to save:\n`{exc}`"), ephemeral=True
+            )
 
 
-async def _economy_panel_embeds(i: discord.Interaction) -> list[discord.Embed]:
-    """Economy sub-panel — current values + field descriptions."""
-    gid = str(i.guild_id)
-    join_b  = await get_config_or_none(gid, "ec.join_bonus")
-    comp_b  = await get_config_or_none(gid, "ec.completion_bonus")
-    max_b   = await get_config_or_none(gid, "ec.base_max_bonus")
-    t_cap   = await get_config_or_none(gid, "ec.t_cap")
+class VoteScoresModal(discord.ui.Modal, title="Edit Vote Scores"):
+    """Sets all three vote score weights in one submit."""
+    pos_in = discord.ui.TextInput(label="Score Positive (👍)", placeholder="e.g. 5")
+    neu_in = discord.ui.TextInput(label="Score Neutral  (😐)", placeholder="e.g. 3")
+    neg_in = discord.ui.TextInput(label="Score Negative (👎)", placeholder="e.g. 1")
 
-    desc_e1 = (
-        f"**Join Bonus** — {_val(join_b, ' pts')}\n"
-        f"**Completion Bonus** — {_val(comp_b, ' pts')}\n"
-        f"**Max Bonus** — {_val(max_b, ' pts')}\n"
-        f"**Time Cap** — {_val(t_cap, ' min')}"
-    )
-    e1 = discord.Embed(title=_T_ECONOMY, description=desc_e1, color=PRIMARY)
+    async def on_submit(self, i: discord.Interaction) -> None:
+        gid = str(i.guild_id)
+        uid = str(i.user.id)
+        errors: list[str] = []
 
-    desc_e2 = (
-        "**Join Bonus** — Points awarded to each participant at the moment they join.\n"
-        "**Completion Bonus** — Extra points distributed when the host ends the event normally.\n"
-        "**Max Bonus** — Hard ceiling on total points a single user can earn per event.\n"
-        "**Time Cap** — Maximum event minutes counted toward time-based bonus scaling.\n\n"
-        "> Adjust **Max Bonus** first if the economy feels inflationary.\n"
-        "> Lower **Time Cap** to reduce the edge gained by running very long events."
-    )
-    e2 = discord.Embed(title=_T_EC_G, description=desc_e2, color=_C_WHITE)
+        async def _save(key: str, raw: str) -> None:
+            val = raw.strip()
+            if not val:
+                return
+            try:
+                float(val)
+                await set_config(gid, key, val, uid)
+            except ValueError:
+                errors.append(f"`{key}` — not a valid number.")
+            except Exception as exc:
+                errors.append(f"`{key}` — {exc}")
 
-    return [e1, e2]
+        await _save("vote.score_positive", self.pos_in.value)
+        await _save("vote.score_neutral",  self.neu_in.value)
+        await _save("vote.score_negative", self.neg_in.value)
 
-
-async def _decay_panel_embeds(i: discord.Interaction) -> list[discord.Embed]:
-    """Decay sub-panel — current zone config + decay mechanics guide."""
-    gid = str(i.guild_id)
-    grace = await get_config_or_none(gid, "decay.grace_days")
-    z1_d  = await get_config_or_none(gid, "decay.zone1_days")
-    z2_d  = await get_config_or_none(gid, "decay.zone2_days")
-    r1    = await get_config_or_none(gid, "decay.rate_zone1")
-    r2    = await get_config_or_none(gid, "decay.rate_zone2")
-    r3    = await get_config_or_none(gid, "decay.rate_zone3")
-
-    desc_e1 = (
-        f"**Grace Period** — {_val(grace, ' days')}\n"
-        f"**Zone 1** — {_val(z1_d, ' days')}  ·  {_val(r1, ' pts/day')}\n"
-        f"**Zone 2** — {_val(z2_d, ' days')}  ·  {_val(r2, ' pts/day')}\n"
-        f"**Zone 3** — indefinite  ·  {_val(r3, ' pts/day')}"
-    )
-    e1 = discord.Embed(title=_T_DECAY, description=desc_e1, color=PRIMARY)
-
-    desc_e2 = (
-        "Inactivity decay runs daily. A user's points erode once the grace period expires.\n\n"
-        "**Grace Period** — Days of inactivity before any decay begins.\n"
-        "**Zone 1 / Zone 2 Duration** — How many days each phase lasts before advancing.\n"
-        "**Zone 3** begins after Zone 1 + Zone 2 has elapsed and runs indefinitely.\n\n"
-        "**Rate Zone 1–3** — Points lost per day in each zone. Zone 3 is the steepest.\n\n"
-        "> Any server activity from the user resets the clock back to the grace period."
-    )
-    e2 = discord.Embed(title=_T_DC_G, description=desc_e2, color=_C_WHITE)
-
-    return [e1, e2]
-
-
-async def _host_panel_embeds(i: discord.Interaction) -> list[discord.Embed]:
-    """Host sub-panel — current host config + field guide."""
-    gid = str(i.guild_id)
-    cooldown    = await get_config_or_none(gid, "host.cooldown_hours")
-    min_dur     = await get_config_or_none(gid, "host.min_duration_minutes")
-    min_voters  = await get_config_or_none(gid, "host.min_voters")
-    income_mult = await get_config_or_none(gid, "host.income_multiplier")
-    rolling     = await get_config_or_none(gid, "host.rolling_window")
-    outlier     = await get_config_or_none(gid, "host.outlier_trim_threshold")
-
-    desc_e1 = (
-        f"**Cooldown** — {_val(cooldown, ' hours')}\n"
-        f"**Min Duration** — {_val(min_dur, ' min')}\n"
-        f"**Min Voters** — {_val(min_voters)}\n"
-        f"**Income Multiplier** — {_val(income_mult, '×')}\n"
-        f"**Rolling Window** — {_val(rolling, ' events')}\n"
-        f"**Outlier Trim** — {_val(outlier, ' votes')}"
-    )
-    e1 = discord.Embed(title=_T_HOST, description=desc_e1, color=PRIMARY)
-
-    desc_e2 = (
-        "**Cooldown** — Hours a host must wait before they can open another event.\n"
-        "**Min Duration** — Events shorter than this threshold don't count toward host rewards.\n"
-        "**Min Voters** — Minimum vote submissions required to update host reputation.\n"
-        "**Income Multiplier** — Host earns this multiple of the standard participant reward.\n"
-        "**Rolling Window** — Number of recent events averaged to compute reputation score.\n"
-        "**Outlier Trim** — Votes above this per-event count are discarded to prevent brigading."
-    )
-    e2 = discord.Embed(title=_T_HO_G, description=desc_e2, color=_C_WHITE)
-
-    return [e1, e2]
-
-
-async def _vote_panel_embeds(i: discord.Interaction) -> list[discord.Embed]:
-    """Vote sub-panel — current scoring config + voting system guide."""
-    gid = str(i.guild_id)
-    window = await get_config_or_none(gid, "vote.window_minutes")
-    pos    = await get_config_or_none(gid, "vote.score_positive")
-    neu    = await get_config_or_none(gid, "vote.score_neutral")
-    neg    = await get_config_or_none(gid, "vote.score_negative")
-
-    desc_e1 = (
-        f"**Vote Window** — {_val(window, ' min')}\n"
-        f"**Score Positive** — {_val(pos, ' pts')}\n"
-        f"**Score Neutral** — {_val(neu, ' pts')}\n"
-        f"**Score Negative** — {_val(neg, ' pts')}"
-    )
-    e1 = discord.Embed(title=_T_VOTE, description=desc_e1, color=PRIMARY)
-
-    desc_e2 = (
-        "Voting opens immediately after an event ends and closes once the window expires.\n\n"
-        "**Vote Window** — Minutes the vote poll stays open after event close.\n"
-        "**Score Positive** — Reputation points added per 👍 vote.\n"
-        "**Score Neutral** — Reputation points added per 😐 vote.\n"
-        "**Score Negative** — Reputation points added per 👎 vote.\n\n"
-        "> Scores feed into the host's rolling reputation average.\n"
-        "> Lower scores don't lock a host out — they reduce priority and income multiplier."
-    )
-    e2 = discord.Embed(title=_T_VO_G, description=desc_e2, color=_C_WHITE)
-
-    return [e1, e2]
-
-
-async def _channel_panel_embeds(i: discord.Interaction) -> list[discord.Embed]:
-    """Channels sub-panel — current assignments + channel purpose guide."""
-    gid = str(i.guild_id)
-    gn_raw  = await get_config_or_none(gid, "channel.gamenight_id")
-    act_raw = await get_config_or_none(gid, "channel.activity_id")
-    vc_raw  = await get_config_or_none(gid, "channel.vc_category_id")
-
-    desc_e1 = (
-        f"**Gamenight** — {_ch(gn_raw)}\n"
-        f"**Activity** — {_ch(act_raw)}\n"
-        f"**VC Category** — {_ch(vc_raw)}"
-    )
-    e1 = discord.Embed(title=_T_CHANNEL, description=desc_e1, color=PRIMARY)
-
-    desc_e2 = (
-        "**Gamenight Channel** — Text channel for event announcements, join calls, and results.\n"
-        "**Activity Channel** — General notification feed: milestones, leaderboards, bot events.\n"
-        "**VC Category** — Voice category where temporary event rooms are created and destroyed.\n\n"
-        "> All three must be assigned for events to function correctly.\n"
-        "> Changes apply immediately — no restart required.\n"
-        "> Use the dropdowns below to select channels."
-    )
-    e2 = discord.Embed(title=_T_CH_G, description=desc_e2, color=_C_WHITE)
-
-    return [e1, e2]
-
-
-async def _system_panel_embeds(i: discord.Interaction) -> list[discord.Embed]:
-    """System sub-panel — current bot state + state-change guide."""
-    gid   = str(i.guild_id)
-    state = await get_config_or_none(gid, "system.state") or "UNCONFIGURED"
-
-    if state == "ACTIVE":
-        indicator = f"{TICK_ACTIVE} **ACTIVE**"
-    elif state == "PAUSED":
-        indicator = f"{ALERT_PAUSED} **PAUSED**"
-    else:
-        indicator = "🔴 **UNCONFIGURED**"
-
-    desc_e1 = (
-        f"Current state: {indicator}\n\n"
-        f"**▶️ ACTIVE** — All public-facing commands are enabled.\n"
-        f"**⏸️ PAUSED** — Public commands are blocked server-wide."
-    )
-    e1 = discord.Embed(title=_T_SYSTEM, description=desc_e1, color=WARNING)
-
-    desc_e2 = (
-        "**▶️ ACTIVE** — Users can join events, check balances, use the shop, and vote. Full functionality.\n"
-        "**⏸️ PAUSED** — `/shop`, `/gamenight`, and all user-facing commands are disabled globally. "
-        "Admin and owner commands remain fully operational.\n\n"
-        "> Use **PAUSED** during maintenance, data migrations, or economy resets\n"
-        "> to prevent race conditions with active users.\n"
-        "> A confirmation prompt is shown before any state change executes."
-    )
-    e2 = discord.Embed(title=_T_SY_G, description=desc_e2, color=_C_WHITE)
-
-    return [e1, e2]
-
-
-async def _force_panel_embeds(_: discord.Interaction) -> list[discord.Embed]:
-    """Force sub-panel — action summary + usage guide."""
-    desc_e1 = (
-        "⚠️ Direct balance manipulation — bypasses all economy logic.\n"
-        "All force actions are permanent and recorded in the audit log.\n\n"
-        "**➕ Award** — Adds points directly to the target's raw balance.\n"
-        "**➖ Deduct** — Removes points. Fails gracefully if the user has no balance."
-    )
-    e1 = discord.Embed(title=_T_FORCE, description=desc_e1, color=WARNING)
-
-    desc_e2 = (
-        "**Target** — Enter a numeric User ID or paste a @mention into the modal.\n"
-        "**Amount** — Must be a positive number. Decimals are supported (e.g. `12.5`).\n\n"
-        "> To get a User ID: right-click or long-press the user → **Copy User ID**.\n"
-        "> Deduct will not push a balance below zero — it fails with an error instead.\n"
-        "> This section is restricted to **Moderators** and above."
-    )
-    e2 = discord.Embed(title=_T_FO_G, description=desc_e2, color=_C_WHITE)
-
-    return [e1, e2]
-
-
-# =====
-# SHARED MODAL: AdminNumberModal
-# FIX-ADM-014: Accepts optional current_value — displayed in modal placeholder.
-# FIX-ADM-003: Error is ephemeral — panel remains usable after a failed submit.
-# =====
-
-class AdminNumberModal(discord.ui.Modal):
-    value_input = discord.ui.TextInput(label="New Value", placeholder="Enter a number...")
-
-    def __init__(self, key: str, title: str, placeholder: str, current_value: str | None = None):
-        super().__init__(title=title[:45])
-        self.cfg_key = key
-        if current_value is not None:
-            self.value_input.placeholder = f"Current: {current_value}  ·  {placeholder}"
+        if errors:
+            await i.response.send_message(
+                embed=error_embed("Some scores failed:\n" + "\n".join(errors)), ephemeral=True
+            )
         else:
-            self.value_input.placeholder = placeholder
-
-    async def on_submit(self, i: discord.Interaction):
-        new_val = self.value_input.value.strip()
-        try:
-            await set_config(str(i.guild_id), self.cfg_key, new_val, str(i.user.id))
             await i.response.send_message(
-                embed=success_embed(f"`{self.cfg_key}` updated to `{new_val}`."),
+                embed=success_embed("Vote scores updated."), ephemeral=True
+            )
+
+
+class ForcePointsModal(discord.ui.Modal):
+    """Direct balance manipulation modal. FIX-ADM-008: uses re.sub for ID parsing."""
+    user_input   = discord.ui.TextInput(label="User ID or @mention", placeholder="e.g. 123456789012345678")
+    amount_input = discord.ui.TextInput(label="Point Amount",        placeholder="e.g. 100")
+
+    def __init__(self, action: str):
+        super().__init__(title=f"Force {'Award' if action == 'award' else 'Deduct'} Points")
+        self.action = action
+
+    async def on_submit(self, i: discord.Interaction) -> None:
+        uid_raw = re.sub(r"[<@!>]", "", self.user_input.value.strip())
+        try:
+            amount = float(self.amount_input.value.strip())
+            uid    = str(int(uid_raw))
+        except ValueError:
+            return await i.response.send_message(
+                embed=error_embed("Invalid User ID or amount. Enter a numeric ID or @mention."),
+                ephemeral=True,
+            )
+
+        if amount <= 0:
+            return await i.response.send_message(
+                embed=error_embed("Amount must be greater than 0."), ephemeral=True
+            )
+
+        gid = str(i.guild_id)
+        if self.action == "award":
+            await award(gid, uid, amount)
+            await i.response.send_message(
+                embed=success_embed(f"Awarded **{amount:.0f} pts** to <@{uid}>."), ephemeral=True
+            )
+        else:
+            ok = await deduct(gid, uid, amount)
+            if ok:
+                await i.response.send_message(
+                    embed=success_embed(f"Deducted **{amount:.0f} pts** from <@{uid}>."), ephemeral=True
+                )
+            else:
+                await i.response.send_message(
+                    embed=error_embed(f"User <@{uid}> not found or has no balance."), ephemeral=True
+                )
+
+
+class AddShopItemModal(discord.ui.Modal, title="Add New Shop Item"):
+    """Creates a new row in shop_items."""
+    label_in = discord.ui.TextInput(label="Item Name",    placeholder="e.g. VIP Badge",     max_length=80)
+    desc_in  = discord.ui.TextInput(label="Description",  placeholder="What does this do?",  style=discord.TextStyle.paragraph, required=False)
+    cost_in  = discord.ui.TextInput(label="Cost (pts)",   placeholder="e.g. 500")
+    type_in  = discord.ui.TextInput(label="Type",         placeholder="consumable / role / rental / permanent")
+
+    async def on_submit(self, i: discord.Interaction) -> None:
+        gid = str(i.guild_id)
+        try:
+            cost = int(self.cost_in.value.strip())
+        except ValueError:
+            return await i.response.send_message(
+                embed=error_embed("Cost must be a whole number."), ephemeral=True
+            )
+
+        item_type = self.type_in.value.strip().lower()
+        if item_type not in ("consumable", "role", "rental", "permanent"):
+            return await i.response.send_message(
+                embed=error_embed("Type must be one of: `consumable`, `role`, `rental`, `permanent`."),
+                ephemeral=True,
+            )
+
+        import uuid
+        item_id = str(uuid.uuid4())[:8]
+
+        pool = await get_pool()
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO shop_items (item_id, guild_id, label, description, cost, item_type, is_active)
+                    VALUES ($1, $2, $3, $4, $5, $6, TRUE)
+                    """,
+                    item_id, gid,
+                    self.label_in.value.strip(),
+                    self.desc_in.value.strip() or None,
+                    cost,
+                    item_type,
+                )
+            await i.response.send_message(
+                embed=success_embed(f"Item **{self.label_in.value.strip()}** created (ID: `{item_id}`)."),
                 ephemeral=True,
             )
         except Exception as exc:
             await i.response.send_message(
-                embed=error_embed(f"Failed to update `{self.cfg_key}`:\n`{exc}`"),
+                embed=error_embed(f"Failed to create item:\n`{exc}`"), ephemeral=True
+            )
+
+
+class EditShopItemModal(discord.ui.Modal):
+    """Edits an existing shop item's label, description, cost, and type."""
+    label_in = discord.ui.TextInput(label="Item Name",  max_length=80)
+    desc_in  = discord.ui.TextInput(label="Description", style=discord.TextStyle.paragraph, required=False)
+    cost_in  = discord.ui.TextInput(label="Cost (pts)")
+    type_in  = discord.ui.TextInput(label="Type (consumable/role/rental/permanent)")
+
+    def __init__(self, item: dict):
+        super().__init__(title=f"Edit: {item['label'][:30]}")
+        self.item_id         = item["item_id"]
+        self.label_in.default = item["label"]
+        self.desc_in.default  = item.get("description") or ""
+        self.cost_in.default  = str(item["cost"])
+        self.type_in.default  = item["item_type"]
+
+    async def on_submit(self, i: discord.Interaction) -> None:
+        gid = str(i.guild_id)
+        try:
+            cost = int(self.cost_in.value.strip())
+        except ValueError:
+            return await i.response.send_message(
+                embed=error_embed("Cost must be a whole number."), ephemeral=True
+            )
+
+        item_type = self.type_in.value.strip().lower()
+        if item_type not in ("consumable", "role", "rental", "permanent"):
+            return await i.response.send_message(
+                embed=error_embed("Type must be: `consumable`, `role`, `rental`, or `permanent`."),
                 ephemeral=True,
             )
 
-
-async def _open_number_modal(
-    i: discord.Interaction,
-    key: str,
-    title: str,
-    placeholder: str,
-) -> None:
-    """Fetches current value then opens the modal with an informative placeholder."""
-    current = await get_config_or_none(str(i.guild_id), key)
-    await i.response.send_modal(
-        AdminNumberModal(key, title, placeholder, current_value=current)
-    )
-
-
-# =====
-# ECONOMY SETTINGS VIEW
-# =====
-
-class AdminEconomyView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-        self.message: discord.Message | None = None
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
-
-    @discord.ui.button(label="Join Bonus", style=discord.ButtonStyle.secondary)
-    async def join_bonus(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "ec.join_bonus", "Join Bonus (pts)", "e.g. 15")
-
-    @discord.ui.button(label="Completion Bonus", style=discord.ButtonStyle.secondary)
-    async def comp_bonus(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "ec.completion_bonus", "Completion Bonus (pts)", "e.g. 10")
-
-    @discord.ui.button(label="Max Bonus", style=discord.ButtonStyle.secondary)
-    async def max_bonus(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "ec.base_max_bonus", "Max Bonus (pts)", "e.g. 50")
-
-    @discord.ui.button(label="Time Cap (min)", style=discord.ButtonStyle.secondary)
-    async def t_cap(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "ec.t_cap", "Time Cap (minutes)", "e.g. 120")
-
-    @discord.ui.button(label="← Back", style=discord.ButtonStyle.secondary, row=1)
-    async def back(self, i: discord.Interaction, _: discord.ui.Button):
-        embeds = await _main_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminMainView())
-
-
-# =====
-# DECAY SETTINGS VIEW
-# FIX-ADM-009: Correctly labelled — was previously mislabelled "Tiers".
-# =====
-
-class AdminDecayView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-        self.message: discord.Message | None = None
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
-
-    @discord.ui.button(label="Grace Days", style=discord.ButtonStyle.secondary)
-    async def grace(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "decay.grace_days", "Grace Days", "Days before decay starts (e.g. 7)")
-
-    @discord.ui.button(label="Zone 1 Days", style=discord.ButtonStyle.secondary)
-    async def z1(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "decay.zone1_days", "Zone 1 Days", "Slow decay zone duration (e.g. 7)")
-
-    @discord.ui.button(label="Zone 2 Days", style=discord.ButtonStyle.secondary)
-    async def z2(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "decay.zone2_days", "Zone 2 Days", "Medium decay zone duration (e.g. 7)")
-
-    @discord.ui.button(label="Rate Zone 1", style=discord.ButtonStyle.secondary, row=1)
-    async def r1(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "decay.rate_zone1", "Rate Zone 1 (pts/day)", "e.g. 5.0")
-
-    @discord.ui.button(label="Rate Zone 2", style=discord.ButtonStyle.secondary, row=1)
-    async def r2(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "decay.rate_zone2", "Rate Zone 2 (pts/day)", "e.g. 15.0")
-
-    @discord.ui.button(label="Rate Zone 3", style=discord.ButtonStyle.secondary, row=1)
-    async def r3(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "decay.rate_zone3", "Rate Zone 3 (pts/day)", "e.g. 30.0")
-
-    @discord.ui.button(label="← Back", style=discord.ButtonStyle.secondary, row=2)
-    async def back(self, i: discord.Interaction, _: discord.ui.Button):
-        embeds = await _main_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminMainView())
-
-
-# =====
-# HOST SETTINGS VIEW
-# FIX-ADM-011: Full UI coverage for host.* config keys.
-# =====
-
-class AdminHostView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-        self.message: discord.Message | None = None
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
-
-    @discord.ui.button(label="Cooldown (hours)", style=discord.ButtonStyle.secondary)
-    async def cooldown(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "host.cooldown_hours", "Host Cooldown (hours)", "e.g. 12")
-
-    @discord.ui.button(label="Min Duration (min)", style=discord.ButtonStyle.secondary)
-    async def min_dur(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "host.min_duration_minutes", "Min Duration (minutes)", "e.g. 45")
-
-    @discord.ui.button(label="Min Voters", style=discord.ButtonStyle.secondary)
-    async def min_voters(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "host.min_voters", "Minimum Voters", "e.g. 5")
-
-    @discord.ui.button(label="Income Multiplier", style=discord.ButtonStyle.secondary)
-    async def income_mult(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "host.income_multiplier", "Host Income Multiplier", "e.g. 2.0")
-
-    @discord.ui.button(label="Rolling Window", style=discord.ButtonStyle.secondary, row=1)
-    async def rolling(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "host.rolling_window", "Reputation Rolling Window (events)", "e.g. 10")
-
-    @discord.ui.button(label="Outlier Trim", style=discord.ButtonStyle.secondary, row=1)
-    async def outlier(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "host.outlier_trim_threshold", "Outlier Trim Threshold", "e.g. 8")
-
-    @discord.ui.button(label="← Back", style=discord.ButtonStyle.secondary, row=2)
-    async def back(self, i: discord.Interaction, _: discord.ui.Button):
-        embeds = await _main_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminMainView())
-
-
-# =====
-# VOTE SETTINGS VIEW
-# FIX-ADM-011: Full UI coverage for vote.* config keys.
-# =====
-
-class AdminVoteView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-        self.message: discord.Message | None = None
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
-
-    @discord.ui.button(label="Vote Window (min)", style=discord.ButtonStyle.secondary)
-    async def window(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "vote.window_minutes", "Vote Window (minutes)", "e.g. 10")
-
-    @discord.ui.button(label="Score Positive", style=discord.ButtonStyle.secondary)
-    async def pos(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "vote.score_positive", "Positive Vote Score", "e.g. 5")
-
-    @discord.ui.button(label="Score Neutral", style=discord.ButtonStyle.secondary)
-    async def neu(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "vote.score_neutral", "Neutral Vote Score", "e.g. 3")
-
-    @discord.ui.button(label="Score Negative", style=discord.ButtonStyle.secondary)
-    async def neg(self, i: discord.Interaction, _: discord.ui.Button):
-        await _open_number_modal(i, "vote.score_negative", "Negative Vote Score", "e.g. 1")
-
-    @discord.ui.button(label="← Back", style=discord.ButtonStyle.secondary, row=1)
-    async def back(self, i: discord.Interaction, _: discord.ui.Button):
-        embeds = await _main_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminMainView())
-
-
-# =====
-# CHANNEL SETTINGS VIEW
-# FIX-ADM-005: callback() defers before DB write to avoid timeouts.
-# =====
-
-class AdminChannelSel(discord.ui.ChannelSelect):
-    def __init__(self, key: str, placeholder: str, ctype: list):
-        self.cfg_key = key
-        super().__init__(placeholder=placeholder, channel_types=ctype, min_values=1, max_values=1)
-
-    async def callback(self, i: discord.Interaction):
-        # FIX-ADM-005: Defer first before DB write.
-        await i.response.defer()
+        pool = await get_pool()
         try:
-            await set_config(str(i.guild_id), self.cfg_key, str(self.values[0].id), str(i.user.id))
-            await i.edit_original_response(
-                embed=success_embed(f"`{self.cfg_key}` updated to <#{self.values[0].id}>!"),
-                view=self.view,
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE shop_items
+                    SET label=$3, description=$4, cost=$5, item_type=$6
+                    WHERE item_id=$1 AND guild_id=$2
+                    """,
+                    self.item_id, gid,
+                    self.label_in.value.strip(),
+                    self.desc_in.value.strip() or None,
+                    cost, item_type,
+                )
+            await i.response.send_message(
+                embed=success_embed("Item updated successfully."), ephemeral=True
             )
         except Exception as exc:
-            await i.edit_original_response(
-                embed=error_embed(f"Failed to update `{self.cfg_key}`:\n`{exc}`"),
-                view=self.view,
+            await i.response.send_message(
+                embed=error_embed(f"Failed to update item:\n`{exc}`"), ephemeral=True
             )
 
 
-class AdminChannelGroupView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-        self.message: discord.Message | None = None
-        self.add_item(AdminChannelSel("channel.gamenight_id", "🎮 Gamenight Channel...", [discord.ChannelType.text]))
-        self.add_item(AdminChannelSel("channel.activity_id",  "📢 Activity Channel...",  [discord.ChannelType.text]))
-        self.add_item(AdminChannelSel("channel.vc_category_id", "🔊 VC Category...",     [discord.ChannelType.category]))
+# =============================================================================
+# CONFIRMATION VIEWS
+# =============================================================================
 
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
-
-    @discord.ui.button(label="← Back", style=discord.ButtonStyle.secondary, row=4)
-    async def back(self, i: discord.Interaction, _: discord.ui.Button):
-        embeds = await _main_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminMainView())
-
-
-# =====
-# SYSTEM SETTINGS VIEW
-# FIX-ADM-004: State changes require ConfirmSystemStateView before execution.
-# FIX-ADM-006: set_active/set_paused defer before DB write.
-# =====
-
-class ConfirmSystemStateView(discord.ui.View):
-    """Confirmation gate before committing a system state change."""
+class ConfirmSystemStateView(_TimeoutView):
+    """Confirmation gate before committing a system state change. FIX-ADM-004."""
 
     def __init__(self, target_state: str):
         super().__init__(timeout=60)
         self.target_state = target_state
-        self.message: discord.Message | None = None
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
 
     @discord.ui.button(label="✅ Yes, Confirm", style=discord.ButtonStyle.danger)
-    async def confirm(self, i: discord.Interaction, _: discord.ui.Button):
+    async def confirm(self, i: discord.Interaction, _: discord.ui.Button) -> None:
         await i.response.defer()
         try:
             await set_config(str(i.guild_id), "system.state", self.target_state, str(i.user.id))
@@ -1772,223 +834,609 @@ class ConfirmSystemStateView(discord.ui.View):
             )
         except Exception as exc:
             await i.edit_original_response(
-                embed=error_embed(f"Failed to change system state:\n`{exc}`"),
-                view=None,
+                embed=error_embed(f"Failed to change system state:\n`{exc}`"), view=None
             )
 
     @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
-    async def cancel(self, i: discord.Interaction, _: discord.ui.Button):
+    async def cancel(self, i: discord.Interaction, _: discord.ui.Button) -> None:
         await i.response.edit_message(
-            embed=discord.Embed(description="State change cancelled.", color=PRIMARY),
-            view=None,
+            embed=discord.Embed(description="State change cancelled.", color=PRIMARY), view=None
         )
 
 
-class AdminSystemView(discord.ui.View):
-    def __init__(self):
+class ConfirmDeleteItemView(_TimeoutView):
+    """Confirmation gate before permanently deleting a shop item."""
+
+    def __init__(self, item_id: str, item_label: str):
+        super().__init__(timeout=60)
+        self.item_id    = item_id
+        self.item_label = item_label
+
+    @discord.ui.button(label="🗑️ Yes, Delete", style=discord.ButtonStyle.danger)
+    async def confirm(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await i.response.defer()
+        pool = await get_pool()
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "DELETE FROM shop_items WHERE item_id=$1 AND guild_id=$2",
+                    self.item_id, str(i.guild_id),
+                )
+            await i.edit_original_response(
+                embed=success_embed(f"Item **{self.item_label}** deleted."), view=None
+            )
+        except Exception as exc:
+            await i.edit_original_response(
+                embed=error_embed(f"Failed to delete item:\n`{exc}`"), view=None
+            )
+
+    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await i.response.edit_message(
+            embed=discord.Embed(description="Deletion cancelled.", color=PRIMARY), view=None
+        )
+
+
+# =============================================================================
+# CHANNEL SELECT COMPONENT
+# =============================================================================
+
+class AdminChannelSel(discord.ui.ChannelSelect):
+    """Inline channel picker that writes directly to bot_config. FIX-ADM-005."""
+
+    def __init__(self, key: str, placeholder: str, ctype: list):
+        self.cfg_key = key
+        super().__init__(placeholder=placeholder, channel_types=ctype, min_values=1, max_values=1)
+
+    async def callback(self, i: discord.Interaction) -> None:
+        await i.response.defer()
+        try:
+            await set_config(str(i.guild_id), self.cfg_key, str(self.values[0].id), str(i.user.id))
+            await i.edit_original_response(
+                embed=success_embed(f"`{self.cfg_key}` set to <#{self.values[0].id}>."),
+                view=self.view,
+            )
+        except Exception as exc:
+            await i.edit_original_response(
+                embed=error_embed(f"Failed to update `{self.cfg_key}`:\n`{exc}`"),
+                view=self.view,
+            )
+
+
+# =============================================================================
+# MANAGE ZONE SELECT
+# =============================================================================
+
+class ManageZoneSelect(discord.ui.Select):
+    """Dropdown of current decay zones. Selecting one opens an edit/delete view."""
+
+    def __init__(self, zones: list[dict]):
+        options = []
+        for z in sorted(zones, key=lambda x: x.get("zone_id", 0)):
+            dur   = int(z.get("duration_days", -1))
+            rate  = float(z.get("rate_per_day", 0))
+            label = z.get("label", f"Zone {z.get('zone_id','?')}")
+            dur_s = f"{dur}d" if dur != -1 else "∞"
+            options.append(discord.SelectOption(
+                label=label[:25],
+                value=str(z.get("zone_id")),
+                description=f"{dur_s} · {rate} pts/day",
+            ))
+        super().__init__(placeholder="Select a zone to manage…", options=options or [
+            discord.SelectOption(label="No zones configured", value="_none", description="Add zones first")
+        ])
+        self._zones = {str(z.get("zone_id")): z for z in zones}
+
+    async def callback(self, i: discord.Interaction) -> None:
+        if self.values[0] == "_none":
+            return await i.response.defer()
+        zone_id = int(self.values[0])
+        zone    = self._zones.get(self.values[0], {})
+        view    = AdminZoneControlView(zone_id, zone, parent_view=self.view)
+        e = discord.Embed(
+            title=f"📐 {zone.get('label', f'Zone {zone_id}')}",
+            description=(
+                f"**Duration:** `{zone.get('duration_days', -1)}d` (-1 = infinite)\n"
+                f"**Rate:** `{zone.get('rate_per_day', 0)} pts/day`\n\n"
+                "Choose an action below."
+            ),
+            color=PRIMARY,
+        )
+        await i.response.edit_message(embeds=[e], view=view)
+
+
+class AdminZoneControlView(_TimeoutView):
+    """Inline control panel for a single decay zone."""
+
+    def __init__(self, zone_id: int, zone: dict, parent_view: discord.ui.View):
         super().__init__(timeout=300)
-        self.message: discord.Message | None = None
+        self.zone_id     = zone_id
+        self.zone        = zone
+        self.parent_view = parent_view
 
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
+    @discord.ui.button(label="✏️ Edit Zone", style=discord.ButtonStyle.primary)
+    async def edit_zone(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await i.response.send_modal(EditZoneModal(self.zone_id))
 
-    @discord.ui.button(label="▶️ Set ACTIVE", style=discord.ButtonStyle.success)
-    async def set_active(self, i: discord.Interaction, _: discord.ui.Button):
+    @discord.ui.button(label="🗑️ Delete Zone", style=discord.ButtonStyle.danger)
+    async def delete_zone(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        gid = str(i.guild_id)
+        raw = await get_config_or_none(gid, "decay.zones_config")
+        try:
+            zones: list[dict] = json.loads(raw) if raw else []
+        except (json.JSONDecodeError, TypeError):
+            zones = []
+
+        zones = [z for z in zones if int(z.get("zone_id", -99)) != self.zone_id]
+        try:
+            await set_config(gid, "decay.zones_config", json.dumps(zones), str(i.user.id))
+            await i.response.send_message(
+                embed=success_embed(f"Zone `{self.zone_id}` deleted."), ephemeral=True
+            )
+        except Exception as exc:
+            await i.response.send_message(
+                embed=error_embed(f"Failed to delete zone:\n`{exc}`"), ephemeral=True
+            )
+
+    @discord.ui.button(label="← Back to Zones", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        embeds = await _point_panel_embeds(i)
+        await i.response.edit_message(embeds=embeds, view=self.parent_view)
+
+
+# =============================================================================
+# MANAGE ITEM SELECT
+# =============================================================================
+
+class ManageItemSelect(discord.ui.Select):
+    """Dropdown of current shop items. Selecting one opens AdminItemControlView."""
+
+    def __init__(self, items: list):
+        options = [
+            discord.SelectOption(
+                label=row["label"][:25],
+                value=row["item_id"],
+                description=f"{row['cost']} pts · {row['item_type']}",
+            )
+            for row in items
+        ] or [discord.SelectOption(label="No items in shop", value="_none", description="Add items first")]
+
+        super().__init__(placeholder="Select an item to manage…", options=options)
+        self._items = {row["item_id"]: dict(row) for row in items}
+
+    async def callback(self, i: discord.Interaction) -> None:
+        if self.values[0] == "_none":
+            return await i.response.defer()
+
+        item = self._items.get(self.values[0])
+        if not item:
+            return await i.response.send_message(
+                embed=error_embed("Item not found. Try reopening the shop panel."), ephemeral=True
+            )
+
+        embeds = await _item_control_embeds(i, item)
+        view   = AdminItemControlView(item, parent_view=self.view)
+        await i.response.edit_message(embeds=embeds, view=view)
+
+
+class AdminItemControlView(_TimeoutView):
+    """Control panel for a single shop item."""
+
+    def __init__(self, item: dict, parent_view: discord.ui.View):
+        super().__init__(timeout=300)
+        self.item        = item
+        self.parent_view = parent_view
+
+    @discord.ui.button(label="✏️ Edit Details & Price", style=discord.ButtonStyle.primary)
+    async def edit_item(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await i.response.send_modal(EditShopItemModal(self.item))
+
+    @discord.ui.button(label="🎚️ Set Rarity", style=discord.ButtonStyle.secondary)
+    async def set_rarity(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        # Rarity is stored as a bot_config key per item to avoid a schema migration.
+        key = f"shop.item.{self.item['item_id']}.rarity"
+        await _open_number_modal(i, key, "Set Item Rarity", "e.g. common / uncommon / rare / legendary")
+
+    @discord.ui.button(label="🛒 Toggle Black Market", style=discord.ButtonStyle.secondary)
+    async def toggle_bm(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await i.response.defer()
+        new_bm = not bool(self.item.get("is_blackmarket", False))
+        pool   = await get_pool()
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE shop_items SET is_blackmarket=$3 WHERE item_id=$1 AND guild_id=$2",
+                    self.item["item_id"], str(i.guild_id), new_bm,
+                )
+            self.item["is_blackmarket"] = new_bm
+            status = "enabled" if new_bm else "disabled"
+            await i.edit_original_response(
+                embed=success_embed(f"Black market {status} for **{self.item['label']}**."),
+                view=self,
+            )
+        except Exception as exc:
+            await i.edit_original_response(
+                embed=error_embed(f"Failed to toggle black market:\n`{exc}`"), view=self
+            )
+
+    @discord.ui.button(label="🗑️ Delete Item", style=discord.ButtonStyle.danger)
+    async def delete_item(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        view = ConfirmDeleteItemView(self.item["item_id"], self.item["label"])
+        e    = confirm_embed(
+            "Confirm Deletion",
+            f"Delete **{self.item['label']}** permanently?\nThis cannot be undone.",
+        )
+        await i.response.edit_message(embed=e, view=view)
+
+    @discord.ui.button(label="← Back to Shop", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await i.response.edit_message(
+            embeds=await _shop_panel_embeds(i, _count_items_from_view(self.parent_view)),
+            view=self.parent_view,
+        )
+
+
+def _count_items_from_view(view: discord.ui.View) -> int:
+    """Extracts the item count from a ManageItemSelect's options for embed display."""
+    for child in view.children:
+        if isinstance(child, ManageItemSelect):
+            return len(child._items)
+    return 0
+
+
+# =============================================================================
+# CATEGORY PANEL VIEWS
+# =============================================================================
+
+class AdminSystemView(_TimeoutView):
+    """⚙️ System & Channels panel."""
+
+    def __init__(self):
+        super().__init__()
+        # Channel selects — each occupies its own row (rows 1-3).
+        self.add_item(AdminChannelSel("channel.gamenight_id",  "🎮 Gamenight Channel…",  [discord.ChannelType.text]))
+        self.add_item(AdminChannelSel("channel.activity_id",   "📢 Activity Channel…",   [discord.ChannelType.text]))
+        self.add_item(AdminChannelSel("channel.vc_category_id","🔊 VC Category…",        [discord.ChannelType.category]))
+
+    # Row 0 — state control
+    @discord.ui.button(label="▶️ Set ACTIVE",  style=discord.ButtonStyle.success,   row=0)
+    async def set_active(self, i: discord.Interaction, _: discord.ui.Button) -> None:
         e = confirm_embed(
             "Confirmation: Set ACTIVE",
-            "The bot will start accepting public commands again.\n"
-            "Ensure all configurations are correct before activating.",
+            "The bot will start accepting public commands.\nEnsure all channels are configured.",
         )
         view = ConfirmSystemStateView("ACTIVE")
         await i.response.edit_message(embed=e, view=view)
 
-    @discord.ui.button(label="⏸️ Set PAUSED", style=discord.ButtonStyle.secondary)
-    async def set_paused(self, i: discord.Interaction, _: discord.ui.Button):
+    @discord.ui.button(label="⏸️ Set PAUSED", style=discord.ButtonStyle.secondary,  row=0)
+    async def set_paused(self, i: discord.Interaction, _: discord.ui.Button) -> None:
         e = confirm_embed(
             "Confirmation: Set PAUSED",
-            "The bot will stop serving public commands (`/shop`, `/gamenight`, etc).\n"
-            "Admin and owner commands will still work.",
-            warning="Currently active users will not be able to start new events.",
+            "The bot will stop serving public commands.\nAdmin commands remain active.",
+            warning="Active events will not be interrupted but no new ones can start.",
         )
         view = ConfirmSystemStateView("PAUSED")
         await i.response.edit_message(embed=e, view=view)
 
-    @discord.ui.button(label="← Back", style=discord.ButtonStyle.secondary, row=1)
-    async def back(self, i: discord.Interaction, _: discord.ui.Button):
-        embeds = await _main_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminMainView())
+    @discord.ui.button(label="🏷️ Point Name",  style=discord.ButtonStyle.secondary,  row=0)
+    async def point_name(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await _open_number_modal(i, "system.point_name", "Rename Currency", "e.g. coins, gems, stars")
 
+    @discord.ui.button(label="⚡ Force Action", style=discord.ButtonStyle.danger,   row=0)
+    async def force_action(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        if not await require_mod(i):
+            return
+        view = _ForceSubView(parent_view=self)
+        e    = discord.Embed(
+            title="⚡ ꜰᴏʀᴄᴇ ᴀᴄᴛɪᴏɴ",
+            description=(
+                "⚠️ Direct balance manipulation — bypasses all economy logic.\n"
+                "All actions are permanent and recorded in the audit log.\n\n"
+                "**➕ Award** — Adds points to the target's raw balance.\n"
+                "**➖ Deduct** — Removes points; floors at 0."
+            ),
+            color=WARNING,
+        )
+        await i.response.edit_message(embed=e, view=view)
 
-# =====
-# FORCE POINTS VIEW
-# FIX-ADM-008: ID parsing fixed from lstrip (char-set) to re.sub (pattern).
-# =====
-
-class ForcePointsModal(discord.ui.Modal):
-    user_input   = discord.ui.TextInput(label="User ID or @mention", placeholder="e.g. 123456789012345678 or @User")
-    amount_input = discord.ui.TextInput(label="Point Amount",        placeholder="e.g. 100")
-
-    def __init__(self, action: str):
-        super().__init__(title=f"Force {'Award' if action == 'award' else 'Deduct'} Points")
-        self.action = action
-
-    async def on_submit(self, i: discord.Interaction):
-        # FIX-ADM-008: re.sub strips mention syntax robustly.
-        uid_raw = re.sub(r"[<@!>]", "", self.user_input.value.strip())
-        try:
-            amount = float(self.amount_input.value.strip())
-            uid    = str(int(uid_raw))
-        except ValueError:
-            return await i.response.send_message(
-                embed=error_embed(
-                    "Invalid User ID or amount.\n"
-                    "Enter a numeric User ID or a mention like `@Username`."
-                ),
-                ephemeral=True,
-            )
-
-        if amount <= 0:
-            return await i.response.send_message(
-                embed=error_embed("Amount must be greater than 0."),
-                ephemeral=True,
-            )
-
-        gid = str(i.guild_id)
-        if self.action == "award":
-            await award(gid, uid, amount)
-            await i.response.send_message(
-                embed=success_embed(f"Awarded **{amount:.0f} pts** to <@{uid}>."),
-                ephemeral=True,
-            )
-        else:
-            ok = await deduct(gid, uid, amount)
-            if ok:
-                await i.response.send_message(
-                    embed=success_embed(f"Deducted **{amount:.0f} pts** from <@{uid}>."),
-                    ephemeral=True,
-                )
-            else:
-                await i.response.send_message(
-                    embed=error_embed(f"User <@{uid}> not found or has no points."),
-                    ephemeral=True,
-                )
-
-
-class AdminForceView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-        self.message: discord.Message | None = None
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
-
-    @discord.ui.button(label="➕ Award Points",  style=discord.ButtonStyle.success)
-    async def award_pts(self, i: discord.Interaction, _: discord.ui.Button):
-        await i.response.send_modal(ForcePointsModal("award"))
-
-    @discord.ui.button(label="➖ Deduct Points", style=discord.ButtonStyle.danger)
-    async def deduct_pts(self, i: discord.Interaction, _: discord.ui.Button):
-        await i.response.send_modal(ForcePointsModal("deduct"))
-
-    @discord.ui.button(label="← Back", style=discord.ButtonStyle.secondary, row=1)
-    async def back(self, i: discord.Interaction, _: discord.ui.Button):
-        embeds = await _main_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminMainView())
-
-
-# =====
-# MAIN PANEL VIEW
-# =====
-
-class AdminMainView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-        self.message: discord.Message | None = None
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        # FIX-ADM-007: Edit Discord message on timeout so buttons don't ghost.
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
-
-    @discord.ui.button(label="⚙️ Economy", style=discord.ButtonStyle.secondary, row=0)
-    async def b1(self, i: discord.Interaction, _: discord.ui.Button):
-        embeds = await _economy_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminEconomyView())
-
-    @discord.ui.button(label="⏱️ Decay", style=discord.ButtonStyle.secondary, row=0)
-    async def b2(self, i: discord.Interaction, _: discord.ui.Button):
-        embeds = await _decay_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminDecayView())
-
-    @discord.ui.button(label="🎮 Host", style=discord.ButtonStyle.secondary, row=0)
-    async def b3(self, i: discord.Interaction, _: discord.ui.Button):
-        embeds = await _host_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminHostView())
-
-    @discord.ui.button(label="🗳️ Vote", style=discord.ButtonStyle.secondary, row=0)
-    async def b4(self, i: discord.Interaction, _: discord.ui.Button):
-        embeds = await _vote_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminVoteView())
-
-    @discord.ui.button(label="📡 Channels", style=discord.ButtonStyle.secondary, row=1)
-    async def b5(self, i: discord.Interaction, _: discord.ui.Button):
-        embeds = await _channel_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminChannelGroupView())
-
-    @discord.ui.button(label="👁️ View All", style=discord.ButtonStyle.primary, row=1)
-    async def b6(self, i: discord.Interaction, _: discord.ui.Button):
+    # Row 4 — utility & back
+    @discord.ui.button(label="👁️ View All Config", style=discord.ButtonStyle.primary, row=4)
+    async def view_all(self, i: discord.Interaction, _: discord.ui.Button) -> None:
         await i.response.defer(ephemeral=True)
         all_cfg = await get_all_config(str(i.guild_id))
         lines   = [f"{k}: {v}" for k, v in sorted(all_cfg.items())]
         txt     = "\n".join(lines)
         file    = discord.File(io.BytesIO(txt.encode()), filename="config_dump.txt")
         await i.followup.send(
-            content=f"📄 Configuration dump — {len(lines)} keys:",
-            file=file,
-            ephemeral=True,
+            content=f"📄 Config dump — {len(lines)} keys:", file=file, ephemeral=True
         )
 
-    @discord.ui.button(label="🔧 System", style=discord.ButtonStyle.danger, row=1)
-    async def b8(self, i: discord.Interaction, _: discord.ui.Button):
+    @discord.ui.button(label="← Main Menu", style=discord.ButtonStyle.secondary, row=4)
+    async def back(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await _navigate_to_root(i, self)
+
+
+class _ForceSubView(_TimeoutView):
+    """Inline award/deduct button pair — shown in place of the system panel."""
+
+    def __init__(self, parent_view: discord.ui.View):
+        super().__init__()
+        self.parent_view = parent_view
+
+    @discord.ui.button(label="➕ Award Points",  style=discord.ButtonStyle.success)
+    async def award_pts(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await i.response.send_modal(ForcePointsModal("award"))
+
+    @discord.ui.button(label="➖ Deduct Points", style=discord.ButtonStyle.danger)
+    async def deduct_pts(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await i.response.send_modal(ForcePointsModal("deduct"))
+
+    @discord.ui.button(label="← Back", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, i: discord.Interaction, _: discord.ui.Button) -> None:
         embeds = await _system_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminSystemView())
-
-    @discord.ui.button(label="⚡ Force", style=discord.ButtonStyle.danger, row=1)
-    async def b9(self, i: discord.Interaction, _: discord.ui.Button):
-        # FIX-ADM-012: Explicit guard check — does not rely on require_mod side-effect.
-        if not await require_mod(i):
-            return
-        embeds = await _force_panel_embeds(i)
-        await i.response.edit_message(embeds=embeds, view=AdminForceView())
+        self.parent_view.message = self.message
+        await i.response.edit_message(embeds=embeds, view=self.parent_view)
 
 
-# =====
-# DISCORD COG MOUNTING
-# =====
+class AdminPointView(_TimeoutView):
+    """👥 Point panel — Economy + Decay unified."""
+
+    # Row 0 — event economy
+    @discord.ui.button(label="📥 Join Bonus",        style=discord.ButtonStyle.secondary, row=0)
+    async def join_bonus(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await _open_number_modal(i, "ec.join_bonus", "Join Bonus (pts)", "e.g. 15")
+
+    @discord.ui.button(label="🏁 Event End Bonus",   style=discord.ButtonStyle.secondary, row=0)
+    async def comp_bonus(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await _open_number_modal(i, "ec.completion_bonus", "Event End Bonus (pts)", "e.g. 10")
+
+    @discord.ui.button(label="⚙️ Event Math",         style=discord.ButtonStyle.primary,   row=0)
+    async def event_math(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await i.response.send_modal(EventMathModal())
+
+    # Row 1 — decay
+    @discord.ui.button(label="🛡️ Grace Period",       style=discord.ButtonStyle.secondary, row=1)
+    async def grace(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await _open_number_modal(i, "decay.grace_days", "Grace Period (days)", "e.g. 7")
+
+    @discord.ui.button(label="➕ Add Zone",            style=discord.ButtonStyle.secondary, row=1)
+    async def add_zone(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await i.response.send_modal(AddZoneModal())
+
+    @discord.ui.button(label="✏️ Manage Zones",        style=discord.ButtonStyle.primary,   row=1)
+    async def manage_zones(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        gid = str(i.guild_id)
+        raw = await get_config_or_none(gid, "decay.zones_config")
+        try:
+            zones: list[dict] = json.loads(raw) if raw else []
+        except (json.JSONDecodeError, TypeError):
+            zones = []
+
+        if not zones:
+            return await i.response.send_message(
+                embed=error_embed("No decay zones configured. Use **➕ Add Zone** first."),
+                ephemeral=True,
+            )
+
+        view = _ZoneSelectView(zones, parent_point_view=self)
+        e    = discord.Embed(
+            title="✏️ ᴍᴀɴᴀɢᴇ ᴢᴏɴᴇꜱ",
+            description="Select a zone from the dropdown to edit or delete it.",
+            color=PRIMARY,
+        )
+        await i.response.edit_message(embed=e, view=view)
+
+    # Row 2 — back
+    @discord.ui.button(label="← Main Menu", style=discord.ButtonStyle.secondary, row=2)
+    async def back(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await _navigate_to_root(i, self)
+
+
+class _ZoneSelectView(_TimeoutView):
+    """Wraps ManageZoneSelect in a navigable view."""
+
+    def __init__(self, zones: list[dict], parent_point_view: discord.ui.View):
+        super().__init__()
+        self.parent_point_view = parent_point_view
+        self.add_item(ManageZoneSelect(zones))
+
+    @discord.ui.button(label="← Back to Point", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        embeds = await _point_panel_embeds(i)
+        self.parent_point_view.message = self.message
+        await i.response.edit_message(embeds=embeds, view=self.parent_point_view)
+
+
+class AdminHostView(_TimeoutView):
+    """🎮 Host & Events panel."""
+
+    @discord.ui.button(label="⏱️ Host Cooldown",         style=discord.ButtonStyle.secondary, row=0)
+    async def cooldown(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await _open_number_modal(i, "host.cooldown_hours", "Host Cooldown (hours)", "e.g. 12")
+
+    @discord.ui.button(label="📏 Min Duration",           style=discord.ButtonStyle.secondary, row=0)
+    async def min_dur(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await _open_number_modal(i, "host.min_duration_minutes", "Min Duration (minutes)", "e.g. 45")
+
+    @discord.ui.button(label="👻 Auto-End VC Tolerance",  style=discord.ButtonStyle.secondary, row=0)
+    async def auto_end(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await _open_number_modal(i, "host.auto_end_tolerance_minutes", "Auto-End Tolerance (minutes)", "e.g. 5")
+
+    @discord.ui.button(label="💰 Income Multiplier",      style=discord.ButtonStyle.secondary, row=1)
+    async def income_mult(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await _open_number_modal(i, "host.income_multiplier", "Host Income Multiplier", "e.g. 2.0")
+
+    @discord.ui.button(label="🔄 Rolling Window",         style=discord.ButtonStyle.secondary, row=1)
+    async def rolling(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await _open_number_modal(i, "host.rolling_window", "Reputation Rolling Window (events)", "e.g. 10")
+
+    @discord.ui.button(label="← Main Menu", style=discord.ButtonStyle.secondary, row=2)
+    async def back(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await _navigate_to_root(i, self)
+
+
+class AdminVoteView(_TimeoutView):
+    """🗳️ Vote & Reputation panel."""
+
+    @discord.ui.button(label="👥 Min Voters",    style=discord.ButtonStyle.secondary, row=0)
+    async def min_voters(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await _open_number_modal(i, "host.min_voters", "Minimum Voters", "e.g. 5")
+
+    @discord.ui.button(label="✂️ Outlier Trim",  style=discord.ButtonStyle.secondary, row=0)
+    async def outlier(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await _open_number_modal(i, "host.outlier_trim_threshold", "Outlier Trim Threshold (votes)", "e.g. 8")
+
+    @discord.ui.button(label="⏲️ Vote Window",   style=discord.ButtonStyle.secondary, row=0)
+    async def window(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await _open_number_modal(i, "vote.window_minutes", "Vote Window (minutes)", "e.g. 10")
+
+    @discord.ui.button(label="⭐ Edit Scores",   style=discord.ButtonStyle.primary,   row=0)
+    async def edit_scores(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await i.response.send_modal(VoteScoresModal())
+
+    @discord.ui.button(label="← Main Menu", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await _navigate_to_root(i, self)
+
+
+class AdminShopView(_TimeoutView):
+    """🛒 Shop Management panel. Requires async construction via AdminShopView.create()."""
+
+    def __init__(self, items: list):
+        super().__init__()
+        self._item_count = len(items)
+        if items:
+            self.add_item(ManageItemSelect(items))
+
+    @classmethod
+    async def create(cls, i: discord.Interaction) -> "AdminShopView":
+        """Async factory: fetches shop items and builds the view."""
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            items = await conn.fetch(
+                "SELECT item_id, label, description, cost, item_type, is_active, is_blackmarket, duration_days "
+                "FROM shop_items WHERE guild_id=$1 AND is_active=TRUE ORDER BY label",
+                str(i.guild_id),
+            )
+        return cls(list(items))
+
+    # Row 0 — note: ManageItemSelect occupies row 0; buttons are on row 1
+    @discord.ui.button(label="➕ Add New Item", style=discord.ButtonStyle.primary, row=1)
+    async def add_item(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await i.response.send_modal(AddShopItemModal())
+
+    @discord.ui.button(label="🌌 Black Market",  style=discord.ButtonStyle.secondary, row=1, disabled=True)
+    async def black_market(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        pass  # 🔒 Coming Soon
+
+    @discord.ui.button(label="← Main Menu", style=discord.ButtonStyle.secondary, row=2)
+    async def back(self, i: discord.Interaction, _: discord.ui.Button) -> None:
+        await _navigate_to_root(i, self)
+
+
+# =============================================================================
+# ROOT NAV SELECT + ROOT VIEW
+# =============================================================================
+
+class AdminNavSelect(discord.ui.Select):
+    """
+    THE single dropdown that IS the /admin main menu.
+    Exactly 5 categories as specified. No buttons on the root view.
+    """
+
+    def __init__(self):
+        options = [
+            discord.SelectOption(
+                label="⚙️ System & Channels",  value="system",
+                description="Bot state, point name, channels, force actions",
+            ),
+            discord.SelectOption(
+                label="👥 Point",               value="point",
+                description="Join/end bonus, event math, grace & decay zones",
+            ),
+            discord.SelectOption(
+                label="🎮 Host & Events",        value="host",
+                description="Cooldown, duration, auto-end, income multiplier",
+            ),
+            discord.SelectOption(
+                label="🗳️ Vote & Reputation",   value="vote",
+                description="Min voters, outlier trim, window, score weights",
+            ),
+            discord.SelectOption(
+                label="🛒 Shop Management",      value="shop",
+                description="Add items, manage listings, black market",
+            ),
+        ]
+        super().__init__(
+            placeholder="Select a category…",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, i: discord.Interaction) -> None:
+        val = self.values[0]
+
+        if val == "system":
+            embeds = await _system_panel_embeds(i)
+            view   = AdminSystemView()
+
+        elif val == "point":
+            embeds = await _point_panel_embeds(i)
+            view   = AdminPointView()
+
+        elif val == "host":
+            embeds = await _host_panel_embeds(i)
+            view   = AdminHostView()
+
+        elif val == "vote":
+            embeds = await _vote_panel_embeds(i)
+            view   = AdminVoteView()
+
+        elif val == "shop":
+            view   = await AdminShopView.create(i)
+            embeds = await _shop_panel_embeds(i, view._item_count)
+
+        else:
+            return await i.response.defer()
+
+        view.message = self.view.message
+        await i.response.edit_message(embeds=embeds, view=view)
+
+
+class AdminRootView(_TimeoutView):
+    """Main /admin view — contains ONLY the AdminNavSelect dropdown."""
+
+    def __init__(self):
+        super().__init__()
+        self.add_item(AdminNavSelect())
+
+
+# =============================================================================
+# BACK-NAVIGATION HELPER
+# =============================================================================
+
+async def _navigate_to_root(i: discord.Interaction, current_view: _TimeoutView) -> None:
+    """
+    Shared back-navigation: re-renders the root panel and swaps to AdminRootView.
+    Pass the current sub-view so the message reference can be forwarded.
+    """
+    embeds    = await _root_panel_embeds(i)
+    root_view = AdminRootView()
+    root_view.message = current_view.message
+    await i.response.edit_message(embeds=embeds, view=root_view)
+
+
+# =============================================================================
+# COG
+# =============================================================================
 
 class AdminCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
     @app_commands.command(name="admin", description="Administrator control panel.")
-    async def admin_cmd(self, i: discord.Interaction):
+    async def admin_cmd(self, i: discord.Interaction) -> None:
         if not await require_admin(i):
             return
 
@@ -1996,42 +1444,44 @@ class AdminCog(commands.Cog):
         state = await get_config_or_none(gid, "system.state")
 
         if not state or state == "UNCONFIGURED":
-            # Auto-initialize with Balanced preset. Channels are configured
-            # post-init via the 📡 Channels button.
+            # First-run: auto-initialise with the Balanced preset.
             await i.response.defer(ephemeral=True)
             try:
                 preset_data = dict(PRESETS["balanced"])
                 preset_data["system.state"]      = "ACTIVE"
                 preset_data["system.guild_name"] = i.guild.name
                 await bulk_set_config(gid, preset_data, str(i.user.id))
-                logger.info(f"[Admin] Guild {gid} auto-initialized with Balanced preset by {i.user.id}.")
+                logger.info(f"[Admin] Guild {gid} auto-initialised with Balanced preset by {i.user.id}.")
             except Exception:
                 logger.exception(f"[Admin] Auto-init failed for guild {gid}.")
                 await i.followup.send(
-                    embed=error_embed("Failed to initialize bot configuration. Check logs."),
+                    embed=error_embed("Failed to initialise bot configuration. Check logs."),
                     ephemeral=True,
                 )
                 return
 
             welcome = discord.Embed(title="🌕  Welcome to Two Moon!", color=0x57F287)
             welcome.description = (
-                "The bot has been initialized with the **Balanced** preset and is now **ACTIVE**.\n\n"
+                "The bot has been initialised with the **Balanced** preset and is now **ACTIVE**.\n\n"
                 "**Next steps:**\n"
-                "• Set your channels via **📡 Channels** — required for events to function.\n"
-                "• Configure access roles via `/owner` → **🔑 Admin Set**.\n"
-                "• Fine-tune economy, decay, and host settings using the buttons below."
+                "• Set channels via **⚙️ System & Channels** → channel dropdowns.\n"
+                "• Configure roles via `/owner` → **🔑 Admin Set**.\n"
+                "• Fine-tune economy and decay via **👥 Point**.\n\n"
+                "Use the dropdown below to navigate."
             )
-            welcome.set_footer(text="All values can be changed anytime from this panel.")
-            main_view = AdminMainView()
-            await i.followup.send(embed=welcome, view=main_view, ephemeral=True)
-            main_view.message = await i.original_response()
+            welcome.set_footer(text="All settings can be changed anytime from this panel.")
+
+            root_view = AdminRootView()
+            await i.followup.send(embed=welcome, view=root_view, ephemeral=True)
+            root_view.message = await i.original_response()
+
         else:
-            embeds    = await _main_panel_embeds(i)
-            main_view = AdminMainView()
-            await i.response.send_message(embeds=embeds, view=main_view, ephemeral=True)
+            embeds    = await _root_panel_embeds(i)
+            root_view = AdminRootView()
+            await i.response.send_message(embeds=embeds, view=root_view, ephemeral=True)
             # FIX-ADM-007: Store message reference for on_timeout.
-            main_view.message = await i.original_response()
+            root_view.message = await i.original_response()
 
 
-async def setup(bot: commands.Bot):
+async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(AdminCog(bot))
