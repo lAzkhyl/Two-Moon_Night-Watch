@@ -1,3 +1,4 @@
+--- .gitignore (原始)
 # Python Artifacts
 __pycache__/
 *.py[cod]
@@ -23,3 +24,22 @@ logs/
 # OS Files
 .DS_Store
 Thumbs.db
+
++++ .gitignore (修改后)
+```
+*.pyc
+__pycache__/
+*.log
+*.tmp
+*.swp
+.env
+.env.local
+.env.*
+.vscode/
+.idea/
+dist/
+build/
+node_modules/
+.venv/
+venv/
+```
