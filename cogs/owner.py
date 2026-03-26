@@ -1568,7 +1568,7 @@ async def _build_ui_editor_panel(i: discord.Interaction):
     return e, OwnerUIEditorView(gid)
 
 
-class EmbedSelect(discord.ui.StringSelect):
+class EmbedSelect(discord.ui.Select):
     """Dropdown for selecting which embed to edit."""
 
     def __init__(self, guild_id: str):
