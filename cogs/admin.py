@@ -992,7 +992,6 @@ class AdminCog(commands.Cog):
 async def setup(bot: commands.Bot):
     await bot.add_cog(AdminCog(bot))
 
-+++ cogs/admin.py (修改后)
 # =====
 # MODULE: cogs/admin.py
 # =====

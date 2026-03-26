@@ -1142,7 +1142,6 @@ class OwnerCog(commands.Cog):
 async def setup(bot: commands.Bot):
     await bot.add_cog(OwnerCog(bot))
 
-+++ cogs/owner.py (修改后)
 # =====
 # MODULE: cogs/owner.py
 # =====
