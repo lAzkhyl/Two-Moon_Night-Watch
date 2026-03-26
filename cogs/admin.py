@@ -1,4 +1,3 @@
---- cogs/admin.py (原始)
 # =====
 # MODULE: cogs/admin.py
 # =====

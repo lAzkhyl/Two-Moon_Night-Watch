@@ -1,7 +1,3 @@
---- db/migrations/006_admin_v4_cms.sql (原始)
-
-
-+++ db/migrations/006_admin_v4_cms.sql (修改后)
 -- =====
 -- MIGRATION 006: Admin V4 CMS & Dynamic Point Zones
 -- Purpose: In-App Embed CMS for /admin panel

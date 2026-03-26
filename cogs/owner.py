@@ -1,4 +1,3 @@
---- cogs/owner.py (原始)
 # =====
 # MODULE: cogs/owner.py
 # =====
